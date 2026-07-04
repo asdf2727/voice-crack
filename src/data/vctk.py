@@ -1,3 +1,33 @@
+"""
+Streaming TBPTT lane manager for the voice-conversion pipeline.
+
+``LaneManager`` is an ``IterableDataset`` implementing persistent-lane (stateful)
+batched truncated BPTT over a map-style utterance dataset (``datasets.vctk``).
+It keeps ``batch_size`` parallel lanes alive, chops each utterance into fixed
+``chunk_len`` chunks, packs ``window_size`` chunks per window, and hot-swaps a
+fresh utterance into a lane the moment its current one runs out -- flagging that
+chunk as a ``reset`` so the training loop can zero that lane's recurrent state.
+Trailing partial chunks are dropped, never padded (the model never sees an
+incomplete chunk).
+
+Each window is a *flattened* raw-waveform vector so whole runs of chunks copy in
+one slice and mel can be applied batched downstream. Per epoch it yields:
+
+    window : float32 [batch_size, window_size * chunk_len]   # raw audio, flattened
+    reset  : bool    [batch_size, window_size]               # True on a lane's first chunk of a new utterance
+    valid  : bool    [batch_size, window_size]               # True where the chunk is real data (== loss mask)
+
+Model side, per chunk c in lane b, in time order:
+    if reset[b, c]: h[:, b, :] = 0        # equivalently  h = h * (~reset)[None, :, None]
+    ... run cell on window[b, c*chunk_len : (c+1)*chunk_len], accumulate loss where valid[b, c] ...
+Detach h between *windows* (that truncates BPTT); ``reset`` handles utterance
+boundaries inside a window.
+
+The dataset yields audio at its native sample rate, so ``chunk_len`` is expressed
+in that rate. Mel/feature extraction, resampling, and the recurrent cell live in
+the model, not here.
+"""
+
 from __future__ import annotations
 
 import random
@@ -8,6 +38,7 @@ import torch
 from torch.utils.data import IterableDataset
 
 from datasets.vctk import VCTKDataset
+
 
 class LaneManager(IterableDataset):
     def __init__(
@@ -23,13 +54,24 @@ class LaneManager(IterableDataset):
         self.batch_size = batch_size
 
         self._rng = random.Random(seed)
-        self._id_pos = len(self._dataset)
-        self._ids = list(range(self._id_pos))
+        self._ids = list(range(len(self._dataset)))
+        self._id_pos = 0
 
     @dataclass
     class _Lane:
-        data: np.ndarray = None
-        pos: int = 0
+        data: np.ndarray = None   # current utterance's samples (None => drained)
+        pos: int = 0              # read cursor, in samples
+
+    def _wav(self, idx: int) -> np.ndarray:
+        """Pull one utterance's waveform as a 1-D float32 numpy array.
+
+        ``dataset[i]`` is ``(waveform_tensor, sample_rate, speaker, utt_id)``; we
+        only need the waveform here.
+        """
+        wav = self._dataset[self._ids[idx]][0]
+        if isinstance(wav, torch.Tensor):
+            wav = wav.numpy()
+        return np.ascontiguousarray(wav, dtype=np.float32)
 
     def _write_lane(self, lane: _Lane, window: np.ndarray, reset: np.ndarray) -> int:
         """
@@ -45,17 +87,22 @@ class LaneManager(IterableDataset):
         while pos < C and lane.data is not None:
             chunks_left = (len(lane.data) - lane.pos) // K
             write = min(chunks_left, C - pos)
-            # Write to window and reset
-            if pos == 0: reset[pos] = True
+            # A reset marks the first real chunk of a freshly loaded utterance:
+            # lane.pos == 0 means we're at the very start of this utterance, and
+            # write > 0 means we actually emit a chunk here (skips too-short utts
+            # and never fires on a cross-window continuation, where lane.pos > 0).
+            if write > 0 and lane.pos == 0:
+                reset[pos] = True
             window[pos * K : (pos + write) * K] = lane.data[lane.pos : lane.pos + write * K]
             pos += write
             lane.pos += write * K
-            # Load next utterance if exhausted
-            if write != chunks_left: continue
+            # Utterance exhausted (its whole chunks consumed) -> load the next one.
+            if write != chunks_left:
+                continue
             if self._id_pos >= len(self._dataset):
                 lane.data = None
                 break
-            lane.data = self._dataset[self._ids[self._id_pos]]
+            lane.data = self._wav(self._id_pos)
             self._id_pos += 1
             lane.pos = 0
         return pos
@@ -63,12 +110,20 @@ class LaneManager(IterableDataset):
     def __iter__(self):
         # Reshuffle each epoch; __iter__ is called once per epoch by convention.
         self._rng.shuffle(self._ids)
-        lanes = [self._Lane(data=self._dataset[self._ids[i]]) for i in range(self.batch_size)]
-        self._id_pos = len(lanes)
+
+        # Prime the lanes (tolerates batch_size > len(dataset): extra lanes start drained).
+        lanes = [self._Lane() for _ in range(self.batch_size)]
+        self._id_pos = 0
+        for lane in lanes:
+            if self._id_pos < len(self._dataset):
+                lane.data = self._wav(self._id_pos)
+                self._id_pos += 1
 
         B, C, K = self.batch_size, self.window_size, self.chunk_len
 
-        while self._id_pos < len(self._dataset):
+        # Run until every lane is drained -- not just until the queue is assigned,
+        # or the last few utterances still buffered in the lanes would be dropped.
+        while True:
             window = np.zeros((B, C * K), dtype=np.float32)
             reset = np.zeros((B, C), dtype=bool)
             valid = np.zeros((B, C), dtype=bool)
@@ -76,6 +131,9 @@ class LaneManager(IterableDataset):
             for b in range(B):
                 written = self._write_lane(lanes[b], window[b], reset[b])
                 valid[b, :written] = True
+
+            if not valid.any():        # all lanes drained -> epoch done
+                return
             yield (
                 torch.from_numpy(window),
                 torch.from_numpy(reset),
@@ -88,16 +146,23 @@ class LaneManager(IterableDataset):
 # ---------------------------------------------------------------------------
 
 class _SyntheticUtts:
-    """Random-length noise utterances, incl. some shorter than one chunk."""
+    """Random-length noise utterances, incl. some shorter than one chunk.
+
+    Mirrors ``VCTKDataset``'s contract: ``__getitem__`` returns a 4-tuple
+    ``(waveform_tensor, sample_rate, speaker, utt_id)`` so LaneManager's ``[0]``
+    extraction path is identical to production.
+    """
 
     def __init__(self, n: int, sr: int, num_speakers: int = 5, seed: int = 0):
         rng = np.random.default_rng(seed)
+        self._sr = sr
         self._data = []
-        for _ in range(n):
+        for i in range(n):
             secs = rng.uniform(0.05, 3.0)          # 0.05s clips are < one chunk -> skipped
             length = int(sr * secs)
             wav = (rng.standard_normal(length).astype(np.float32) * 0.1)
-            self._data.append((wav, int(rng.integers(num_speakers))))
+            spk = f"p{int(rng.integers(num_speakers)):03d}"
+            self._data.append((torch.from_numpy(wav), sr, spk, str(i)))
 
     def __len__(self):
         return len(self._data)
@@ -108,24 +173,27 @@ class _SyntheticUtts:
 
 def _selftest():
     sr, chunk = 16000, 3200                        # 200 ms chunks
+    B, C = 4, 8
     utts = _SyntheticUtts(n=37, sr=sr, num_speakers=5, seed=1)
-    lm = LaneManager(utts, chunk_len=chunk, window_size=8, batch_size=4)
+    lm = LaneManager(utts, chunk_len=chunk, window_size=C, batch_size=B)
 
     total_valid = total_reset = n_windows = 0
-    for window, speaker, reset, valid in lm:
-        assert window.shape == (4, 8, chunk)
-        assert speaker.shape == reset.shape == valid.shape == (4, 8)
+    for window, reset, valid in lm:
+        assert window.shape == (B, C * chunk), window.shape
+        assert reset.shape == valid.shape == (B, C), (reset.shape, valid.shape)
         assert not bool((reset & ~valid).any()), "reset must only land on valid chunks"
-        assert bool((speaker[valid] >= 0).all()), "valid chunks must have a speaker"
-        assert bool((speaker[~valid] == -1).all()), "invalid chunks must be sentinel -1"
         total_valid += int(valid.sum())
         total_reset += int(reset.sum())
         n_windows += 1
 
     # Conservation: every whole chunk of every utterance is emitted exactly once,
-    # and each utterance that yields >=1 chunk triggers exactly one reset.
-    expected_valid = sum(len(utts[i][0]) // chunk for i in range(len(utts)))
-    utts_with_chunks = sum(1 for i in range(len(utts)) if len(utts[i][0]) // chunk >= 1)
+    # and each utterance that yields >=1 chunk triggers exactly one reset. These
+    # three quantities together catch the type/reset/termination bugs: early
+    # termination lowers total_valid; a continuation reset raises total_reset; a
+    # missing mid-window reset lowers it.
+    lengths = [len(utts[i][0]) for i in range(len(utts))]
+    expected_valid = sum(n // chunk for n in lengths)
+    utts_with_chunks = sum(1 for n in lengths if n // chunk >= 1)
     assert total_valid == expected_valid, (total_valid, expected_valid)
     assert total_reset == utts_with_chunks, (total_reset, utts_with_chunks)
 
@@ -138,11 +206,11 @@ def _selftest():
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="VCTK dataset / lane manager")
+    ap = argparse.ArgumentParser(description="LaneManager over VCTK / synthetic audio")
     ap.add_argument("--root", type=str, default=None,
                     help="VCTK-0.92 root (the dir containing wav48_silence_trimmed)")
-    ap.add_argument("--sample-rate", type=int, default=16000)
-    ap.add_argument("--mic", type=str, default="mic1")
+    ap.add_argument("--mic", type=str, default="any",
+                    help="mic id (e.g. mic1, mic2) or 'any'")
     ap.add_argument("--selftest", action="store_true",
                     help="run the synthetic lane-logic test (no dataset needed)")
     args = ap.parse_args()
@@ -150,13 +218,13 @@ if __name__ == "__main__":
     if args.selftest or args.root is None:
         _selftest()
     else:
-        ds = VCTKDataset(args.root)
+        ds = VCTKDataset(args.root, mic_id=args.mic)
         print(f"{len(ds)} utterances")
-        wav, sr, spk, id = ds[0]
-        print(f"utt0: {tuple(wav.shape)} samples @ {sr} Hz, speaker id {spk}")
+        wav, sr, spk, utt = ds[0]
+        print(f"utt0: {tuple(wav.shape)} samples @ {sr} Hz, speaker {spk}, id {utt}")
 
         chunk = int(0.2 * sr)
         lm = LaneManager(ds, chunk_len=chunk, window_size=8, batch_size=4)
-        window, speaker, reset, valid = next(iter(lm))
+        window, reset, valid = next(iter(lm))
         print(f"first window: {tuple(window.shape)} | "
               f"valid {int(valid.sum())}/{valid.numel()} | resets {int(reset.sum())}")
