@@ -1,29 +1,23 @@
 """
 Streaming TBPTT lane manager for the voice-conversion pipeline.
 
-``LaneManager`` is an ``IterableDataset`` implementing persistent-lane (stateful)
-batched truncated BPTT over a map-style utterance dataset (``datasets.vctk``).
-It keeps ``batch_size`` parallel lanes alive, chops each utterance into fixed
-``chunk_len`` chunks, packs ``window_size`` chunks per window, and hot-swaps a
+`LaneManager` is an `IterableDataset` implementing persistent-lane (stateful)
+batched truncated BPTT over a map-style utterance dataset (`datasets.vctk`).
+It keeps `batch_size` parallel lanes alive, chops each utterance into fixed
+`chunk_len` chunks, packs `window_size` chunks per window, and hot-swaps a
 fresh utterance into a lane the moment its current one runs out -- flagging that
-chunk as a ``reset`` so the training loop can zero that lane's recurrent state.
+chunk as a `reset` so the training loop can zero that lane's recurrent state.
 Trailing partial chunks are dropped, never padded (the model never sees an
 incomplete chunk).
 
-Each window is a *flattened* raw-waveform vector so whole runs of chunks copy in
+Each window is a *flattened* raw-waveform vector, so whole runs of chunks copy in
 one slice and mel can be applied batched downstream. Per epoch it yields:
 
-    window : float32 [batch_size, window_size * chunk_len]   # raw audio, flattened
-    reset  : bool    [batch_size, window_size]               # True on a lane's first chunk of a new utterance
-    valid  : bool    [batch_size, window_size]               # True where the chunk is real data (== loss mask)
+- **window**: float32[batch_size, window_size * chunk_len] -- raw audio, flattened
+- **reset**: bool[batch_size, window_size] -- True on a lane's first chunk of a new utterance
+- **valid**: bool[batch_size, window_size] -- True where the chunk is real data (== loss mask)
 
-Model side, per chunk c in lane b, in time order:
-    if reset[b, c]: h[:, b, :] = 0        # equivalently  h = h * (~reset)[None, :, None]
-    ... run cell on window[b, c*chunk_len : (c+1)*chunk_len], accumulate loss where valid[b, c] ...
-Detach h between *windows* (that truncates BPTT); ``reset`` handles utterance
-boundaries inside a window.
-
-The dataset yields audio at its native sample rate, so ``chunk_len`` is expressed
+The dataset yields audio at its native sample rate, so `chunk_len` is expressed
 in that rate. Mel/feature extraction, resampling, and the recurrent cell live in
 the model, not here.
 """
@@ -37,8 +31,7 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 
-from datasets.vctk import VCTKDataset
-
+from vctk import VCTKDataset
 
 class LaneManager(IterableDataset):
     def __init__(
@@ -66,7 +59,7 @@ class LaneManager(IterableDataset):
         """
         Writes to window and reset inplace. Skips utterances with no full
         chunk left (drops the trailing partial), hot-loading the next one; the
-        first chunk of any freshly loaded utterance gets ``reset=True``.
+        first chunk of any freshly loaded utterance gets `reset=True`.
 
         Returns how many chunks have been written, different from window size
         only when the queue is exhausted and the lane has nothing left.
@@ -137,8 +130,8 @@ class LaneManager(IterableDataset):
 class _SyntheticUtts:
     """Random-length noise utterances, incl. some shorter than one chunk.
 
-    Mirrors ``VCTKDataset``'s contract: ``__getitem__`` returns a 4-tuple
-    ``(waveform_tensor, sample_rate, speaker, utt_id)`` so LaneManager's ``[0]``
+    Mirrors `VCTKDataset`'s contract: `__getitem__` returns a 4-tuple
+    `(waveform_tensor, sample_rate, speaker, utt_id)` so LaneManager's `[0]`
     extraction path is identical to production.
     """
 
