@@ -30,7 +30,7 @@ class DeviceSource(StreamSource):
         if status: print(status, file=sys.stderr)
         self.q.put(indata.copy())
 
-    def get_chunk(self) -> np.ndarray | None:
+    def get_next_chunk(self) -> np.ndarray | None:
         if self._stream is None: return None
         return self._to_mono(self.q.get())
 
@@ -74,6 +74,6 @@ class DeviceSink(StreamSink):
     @staticmethod
     def dump_source(source: StreamSource):
         with DeviceSink(source.chunk_size(), sr=source.sample_rate()) as sink:
-            while (chunk := source.get_chunk()) is not None:
+            while (chunk := source.get_next_chunk()) is not None:
                 sink.put_chunk(chunk)
             sleep(0.5) # wait for the buffered stream to finish

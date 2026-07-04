@@ -1,36 +1,34 @@
-import random
 from pathlib import Path
-import numpy as np
-import soundfile as sf
-import soxr
 import torch
 from torch.utils.data import Dataset
 
+from audio.file_stream import FileSource
+
+
 class VCTKDataset(Dataset):
-    def __init__(self, root: str, sample_rate: int = 48000,
-                 segment_seconds: float = 1.0):
-        wav_dir = Path(root) / "wav48_silence_trimmed"
-        self.files = sorted(wav_dir.glob(f"p*/*.flac"))   # the index — paths only
-        if not self.files:
-            raise FileNotFoundError(f"No flac under {wav_dir}")
-        speakers = sorted({f.parent.name for f in self.files})
-        self.sample_rate = sample_rate
-        self.segment_len = int(sample_rate * segment_seconds)
+    def __init__(
+            self,
+            root: str,
+            mic_id: str = 'any',
+            download: bool = False,
+            url: str = 'https://datashare.is.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip',
+            audio_ext='flac'):
+        self._root = Path(root) / "wav48_silence_trimmed"
+        if not self._root.exists():
+            if not download: raise FileNotFoundError(f"{root} not a valid VCTK dataset")
+            # TODO download
+
+        if mic_id is "any": self.files = sorted(self._root.glob(f"p*/*.{audio_ext}"))
+        else: self.files = sorted(self._root.glob(f"p*/*_{mic_id}.{audio_ext}"))
+        if not self.files: raise FileNotFoundError(f"No {audio_ext} under {self._root}")
 
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, str, str]:
         path = self.files[idx]
-        wav, src_sr = sf.read(path, dtype="float32")
-        if wav.ndim == 2:
-            wav = wav.mean(axis=1)                       # your _to_mono, inline
-        if src_sr != self.sample_rate:
-            wav = soxr.resample(wav, src_sr, self.sample_rate)
-        wav = self._fix_length(wav)                      # → exactly segment_len samples
-        speaker = self.speaker_to_id[path.parent.name]
-        return torch.from_numpy(wav), speaker
+        source = FileSource(path, 0)
+        wav = source.get_file()
+        ids = path.name.split("_")
+        return torch.from_numpy(wav), source.sample_rate(), ids[0], ids[1]
 
-from torch.utils.data import DataLoader
-ds = VCTKDataset("/path/to/VCTK-Corpus-0.92", sample_rate=16000, segment_seconds=1.0)
-loader = DataLoader(ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
