@@ -1,187 +1,81 @@
-"""
-VCTK dataset + streaming TBPTT lane manager for the voice-conversion pipeline.
-
-Two pieces, deliberately decoupled:
-
-1. ``VCTKDataset`` -- a plain map-style ``Dataset``. Dumb utterance provider:
-   given an index it loads ONE full utterance (mono, resampled) plus its speaker
-   id. Variable length on purpose; NO cropping. This is the thing you can also
-   hand to a normal ``DataLoader`` for e.g. precomputing speaker vectors.
-
-2. ``LaneManager`` -- an ``IterableDataset`` implementing persistent-lane
-   (stateful) batched truncated BPTT. It keeps ``num_lanes`` parallel streams
-   alive, chops each utterance into fixed-size ``chunk`` s, packs
-   ``chunks_per_window`` of them into a window, and hot-swaps a fresh utterance
-   into a lane the moment its current one runs out -- flagging that chunk as a
-   ``reset`` so the training loop can zero that lane's recurrent state.
-   Trailing partial chunks are DROPPED, never padded, so the model never sees an
-   incomplete chunk (this is the "mask before the last chunk" behaviour: a chunk
-   is only ever emitted whole, and ``valid`` marks which chunks carry real data).
-
-Everything here is in *chunk units of raw waveform*. Mel/feature extraction and
-the recurrent cell live in the model, not here -- compute mel batched on GPU in
-the training step. The window a LaneManager yields is raw audio:
-
-    window : float32 [num_lanes, chunks_per_window, chunk]   # the audio
-    speaker: int64   [num_lanes, chunks_per_window]          # speaker id per chunk (-1 if invalid)
-    reset  : bool    [num_lanes, chunks_per_window]          # True on a lane's first chunk of a new utterance
-    valid  : bool    [num_lanes, chunks_per_window]          # True where the chunk is real data (== loss mask)
-
-Model side, per chunk c in lane b, in time order:
-    if reset[b, c]: h[:, b, :] = 0        # equivalently  h = h * (~reset)[None, :, None]
-    out = cell(window[b, c], h[:, b])     # cell loops the mel frames inside the chunk
-    ... accumulate loss only where valid[b, c] ...
-Detach h between *windows* (that's what truncates BPTT); the reset above handles
-utterance boundaries inside a window.
-"""
-
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import soundfile as sf
-import soxr
 import torch
-from torch.utils.data import Dataset, IterableDataset
-
-
-class VCTKDataset(Dataset):
-    """Map-style provider of full VCTK-0.92 utterances (mono, resampled)."""
-
-    def __init__(self, root: str, sample_rate: int = 16000, mic: str = "mic1"):
-        wav_dir = Path(root) / "wav48_silence_trimmed"
-        # Index paths only -- no audio is decoded until __getitem__.
-        self.files = sorted(wav_dir.glob(f"p*/*_{mic}.flac"))
-        if not self.files:
-            raise FileNotFoundError(f"No {mic} .flac files under {wav_dir}")
-        # Speaker string ('p225') -> contiguous int id, for embedding lookup / clustering.
-        speakers = sorted({f.parent.name for f in self.files})
-        self.speaker_to_id = {s: i for i, s in enumerate(speakers)}
-        self.sample_rate = sample_rate
-
-    @property
-    def num_speakers(self) -> int:
-        return len(self.speaker_to_id)
-
-    def __len__(self) -> int:
-        return len(self.files)
-
-    def __getitem__(self, idx: int):
-        path = self.files[idx]
-        wav, src_sr = sf.read(path, dtype="float32")
-        if wav.ndim == 2:
-            wav = wav.mean(axis=1)                      # -> mono
-        if src_sr != self.sample_rate:
-            wav = soxr.resample(wav, src_sr, self.sample_rate, "VHQ")
-        wav = np.ascontiguousarray(wav, dtype=np.float32)
-        return torch.from_numpy(wav), self.speaker_to_id[path.parent.name]
-
-
-@dataclass
-class _Lane:
-    """Mutable per-lane state carried across windows within one epoch."""
-    wav: np.ndarray | None = None   # current utterance's samples (None => empty/drained)
-    pos: int = 0                    # read cursor, in samples
-    speaker: int = -1               # current utterance's speaker id
-
+from torch.utils.data import IterableDataset
 
 class LaneManager(IterableDataset):
-    """
-    Persistent-lane batched TBPTT over an utterance source.
+    def __init__(
+            self,
+            dataset,
+            chunk_len: int,
+            window_size: int,
+            batch_size: int = 1,
+            seed: int = 0):
+        self._dataset = dataset
+        self.chunk_len = chunk_len
+        self.window_size = window_size
+        self.batch_size = batch_size
 
-    ``utts`` is anything indexable that returns ``(waveform, speaker_id)`` --
-    typically a ``VCTKDataset``, but any ``__len__`` / ``__getitem__`` pair works
-    (see ``_SyntheticUtts`` in the self-test). One decode per utterance per epoch,
-    so memory stays flat regardless of corpus size.
+        self._rng = random.Random(seed)
+        self._id_pos = len(self._dataset)
+        self._ids = list(range(self._id_pos))
 
-    NOTE on workers: an IterableDataset is *replicated* into every DataLoader
-    worker, and the lane state here is inherently central, so run this with
-    ``num_workers=0`` (or don't wrap it in a DataLoader at all -- it already
-    yields full batches). Parallelise the raw audio *decode* separately later if
-    __getitem__ becomes the bottleneck.
-    """
+    @dataclass
+    class _Lane:
+        data: np.ndarray = None
+        pos: int = 0
 
-    def __init__(self, utts, num_lanes: int, chunk: int,
-                 chunks_per_window: int, seed: int = 0):
-        self.utts = utts
-        self.num_lanes = num_lanes
-        self.chunk = chunk
-        self.chunks_per_window = chunks_per_window
-        self.seed = seed
-        self._epoch = 0
-
-    # --- utterance plumbing -------------------------------------------------
-
-    def _get_wav(self, idx: int):
-        wav, spk = self.utts[idx]
-        if isinstance(wav, torch.Tensor):
-            wav = wav.numpy()
-        return np.asarray(wav, dtype=np.float32), int(spk)
-
-    def _load_next(self, lane: _Lane, queue: list[int]) -> bool:
-        """Pull the next utterance into ``lane``. False if the queue is empty."""
-        if not queue:
-            lane.wav = None
-            return False
-        lane.wav, lane.speaker = self._get_wav(queue.pop())
-        lane.pos = 0
-        return True
-
-    def _take_chunk(self, lane: _Lane, queue: list[int]):
+    def _write_lane(self, lane: _Lane, window: np.ndarray, reset: np.ndarray) -> int:
         """
-        Advance ``lane`` by one whole chunk.
-
-        Returns ``(chunk, speaker, reset, valid)``. Skips utterances with no full
+        Writes to window and reset inplace. Skips utterances with no full
         chunk left (drops the trailing partial), hot-loading the next one; the
-        first chunk of any freshly loaded utterance gets ``reset=True``. When the
-        queue is exhausted and the lane has nothing left, returns a drained slot
-        (``valid=False``).
-        """
-        reset = False
-        while lane.wav is None or lane.pos + self.chunk > len(lane.wav):
-            reset = True
-            if not self._load_next(lane, queue):
-                return None, -1, False, False          # drained
-        chunk = lane.wav[lane.pos:lane.pos + self.chunk]
-        lane.pos += self.chunk
-        return chunk, lane.speaker, reset, True
+        first chunk of any freshly loaded utterance gets ``reset=True``.
 
-    # --- iteration ----------------------------------------------------------
+        Returns how many chunks have been written, different from window size
+        only when the queue is exhausted and the lane has nothing left.
+        """
+        C, K = self.window_size, self.chunk_len
+        pos = 0
+        while pos < C and lane.data is not None:
+            chunks_left = (len(lane.data) - lane.pos) // K
+            write = min(chunks_left, C - pos)
+            # Write to window and reset
+            if pos == 0: reset[pos] = True
+            window[pos * K : (pos + write) * K] = lane.data[lane.pos : lane.pos + write * K]
+            pos += write
+            lane.pos += write * K
+            # Load next utterance if exhausted
+            if write != chunks_left: continue
+            if self._id_pos >= len(self._dataset):
+                lane.data = None
+                break
+            lane.data = self._dataset[self._ids[self._id_pos]]
+            self._id_pos += 1
+            lane.pos = 0
+        return pos
 
     def __iter__(self):
         # Reshuffle each epoch; __iter__ is called once per epoch by convention.
-        rng = random.Random(self.seed + self._epoch)
-        self._epoch += 1
-        queue = list(range(len(self.utts)))
-        rng.shuffle(queue)
+        self._rng.shuffle(self._ids)
+        lanes = [self._Lane(data=self._dataset[self._ids[i]]) for i in range(self.batch_size)]
+        self._id_pos = len(lanes)
 
-        lanes = [_Lane() for _ in range(self.num_lanes)]
-        B, C, K = self.num_lanes, self.chunks_per_window, self.chunk
+        B, C, K = self.batch_size, self.window_size, self.chunk_len
 
-        while True:
-            window = np.zeros((B, C, K), dtype=np.float32)
-            speaker = np.full((B, C), -1, dtype=np.int64)
+        while self._id_pos < len(self._dataset):
+            window = np.zeros((B, C * K), dtype=np.float32)
             reset = np.zeros((B, C), dtype=bool)
             valid = np.zeros((B, C), dtype=bool)
 
             for b in range(B):
-                for c in range(C):
-                    chunk, spk, rst, val = self._take_chunk(lanes[b], queue)
-                    reset[b, c] = rst
-                    valid[b, c] = val
-                    if val:
-                        window[b, c] = chunk
-                        speaker[b, c] = spk
-
-            if not valid.any():        # queue empty and every lane drained -> epoch done
-                return
-
+                written = self._write_lane(lanes[b], window[b], reset[b])
+                valid[b, :written] = True
             yield (
                 torch.from_numpy(window),
-                torch.from_numpy(speaker),
                 torch.from_numpy(reset),
                 torch.from_numpy(valid),
             )
