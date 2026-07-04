@@ -62,17 +62,6 @@ class LaneManager(IterableDataset):
         data: np.ndarray = None   # current utterance's samples (None => drained)
         pos: int = 0              # read cursor, in samples
 
-    def _wav(self, idx: int) -> np.ndarray:
-        """Pull one utterance's waveform as a 1-D float32 numpy array.
-
-        ``dataset[i]`` is ``(waveform_tensor, sample_rate, speaker, utt_id)``; we
-        only need the waveform here.
-        """
-        wav = self._dataset[self._ids[idx]][0]
-        if isinstance(wav, torch.Tensor):
-            wav = wav.numpy()
-        return np.ascontiguousarray(wav, dtype=np.float32)
-
     def _write_lane(self, lane: _Lane, window: np.ndarray, reset: np.ndarray) -> int:
         """
         Writes to window and reset inplace. Skips utterances with no full
@@ -102,7 +91,7 @@ class LaneManager(IterableDataset):
             if self._id_pos >= len(self._dataset):
                 lane.data = None
                 break
-            lane.data = self._wav(self._id_pos)
+            lane.data = self._dataset[self._ids[self._id_pos]][0]
             self._id_pos += 1
             lane.pos = 0
         return pos
@@ -111,13 +100,10 @@ class LaneManager(IterableDataset):
         # Reshuffle each epoch; __iter__ is called once per epoch by convention.
         self._rng.shuffle(self._ids)
 
-        # Prime the lanes (tolerates batch_size > len(dataset): extra lanes start drained).
-        lanes = [self._Lane() for _ in range(self.batch_size)]
-        self._id_pos = 0
-        for lane in lanes:
-            if self._id_pos < len(self._dataset):
-                lane.data = self._wav(self._id_pos)
-                self._id_pos += 1
+        if self.batch_size > len(self._dataset):
+            raise ValueError(f"batch_size {self.batch_size} > dataset size {len(self._dataset)}")
+        lanes = [self._Lane(data=self._dataset[self._ids[i]][0]) for i in range(self.batch_size)]
+        self._id_pos = len(lanes)
 
         B, C, K = self.batch_size, self.window_size, self.chunk_len
 
@@ -127,13 +113,16 @@ class LaneManager(IterableDataset):
             window = np.zeros((B, C * K), dtype=np.float32)
             reset = np.zeros((B, C), dtype=bool)
             valid = np.zeros((B, C), dtype=bool)
+            any_valid = False
 
             for b in range(B):
                 written = self._write_lane(lanes[b], window[b], reset[b])
                 valid[b, :written] = True
+                any_valid |= bool(written)
 
-            if not valid.any():        # all lanes drained -> epoch done
+            if not any_valid:
                 return
+
             yield (
                 torch.from_numpy(window),
                 torch.from_numpy(reset),
@@ -187,7 +176,7 @@ def _selftest():
         n_windows += 1
 
     # Conservation: every whole chunk of every utterance is emitted exactly once,
-    # and each utterance that yields >=1 chunk triggers exactly one reset. These
+    # and each utterance that yields >= 1 chunk triggers exactly one reset. These
     # three quantities together catch the type/reset/termination bugs: early
     # termination lowers total_valid; a continuation reset raises total_reset; a
     # missing mid-window reset lowers it.
