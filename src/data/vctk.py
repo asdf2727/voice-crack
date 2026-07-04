@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 
+from datasets.vctk import VCTKDataset
+
 class LaneManager(IterableDataset):
     def __init__(
             self,
@@ -107,7 +109,7 @@ class _SyntheticUtts:
 def _selftest():
     sr, chunk = 16000, 3200                        # 200 ms chunks
     utts = _SyntheticUtts(n=37, sr=sr, num_speakers=5, seed=1)
-    lm = LaneManager(utts, num_lanes=4, chunk=chunk, chunks_per_window=8, seed=0)
+    lm = LaneManager(utts, chunk_len=chunk, window_size=8, batch_size=4)
 
     total_valid = total_reset = n_windows = 0
     for window, speaker, reset, valid in lm:
@@ -148,13 +150,13 @@ if __name__ == "__main__":
     if args.selftest or args.root is None:
         _selftest()
     else:
-        ds = VCTKDataset(args.root, sample_rate=args.sample_rate, mic=args.mic)
-        print(f"{len(ds)} utterances, {ds.num_speakers} speakers")
-        wav, spk = ds[0]
-        print(f"utt0: {tuple(wav.shape)} samples @ {ds.sample_rate} Hz, speaker id {spk}")
+        ds = VCTKDataset(args.root)
+        print(f"{len(ds)} utterances")
+        wav, sr, spk, id = ds[0]
+        print(f"utt0: {tuple(wav.shape)} samples @ {sr} Hz, speaker id {spk}")
 
-        chunk = int(0.2 * ds.sample_rate)
-        lm = LaneManager(ds, num_lanes=8, chunk=chunk, chunks_per_window=8)
+        chunk = int(0.2 * sr)
+        lm = LaneManager(ds, chunk_len=chunk, window_size=8, batch_size=4)
         window, speaker, reset, valid = next(iter(lm))
         print(f"first window: {tuple(window.shape)} | "
               f"valid {int(valid.sum())}/{valid.numel()} | resets {int(reset.sum())}")
