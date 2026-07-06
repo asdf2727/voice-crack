@@ -30,4 +30,3 @@ class VCTKDataset(Dataset):
         source = FileSource(path, 0)
         ids = path.name.split("_")
         return source.get_file(), source.sample_rate(), ids[0], ids[1]
-
