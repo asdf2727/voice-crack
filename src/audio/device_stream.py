@@ -37,7 +37,7 @@ class DeviceSource(StreamSource):
 class DeviceSink(StreamSink):
     def __init__(self, chunk_size: int, sr: int = 44100):
         self.q = queue.Queue[np.ndarray](maxsize=4)
-        print(sd.query_devices())
+        #print(sd.query_devices())
         self._stream = sd.OutputStream(
             samplerate=sr,
             blocksize=chunk_size,

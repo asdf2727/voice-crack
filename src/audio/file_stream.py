@@ -16,7 +16,7 @@ class FileSource(StreamSource):
         self._chunk_size = int(self._sr * chunk_time)
         self.current_sample = 0
 
-    def get_file(self) -> np.ndarray: return self._wav
+    def get_wav(self) -> np.ndarray: return self._wav
 
     def get_next_chunk(self) -> np.ndarray | None:
         if self._wav is None: return None
