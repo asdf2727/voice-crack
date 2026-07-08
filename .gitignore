@@ -3,3 +3,5 @@ CLAUDE.md
 .venv
 *.flac
 __pycache__/
+checkpoints
+/datasets

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import numpy as np
@@ -18,8 +19,11 @@ class VCTKDataset(Dataset):
             if not download: raise FileNotFoundError(f"{root} not a valid VCTK dataset")
             # TODO download
 
-        if mic_id == "any": self.files = sorted(self._root.glob(f"p*/*.{audio_ext}"))
-        else: self.files = sorted(self._root.glob(f"p*/*_{mic_id}.{audio_ext}"))
+        if mic_id == "any": self.files = self._root.glob(f"p*/*.{audio_ext}")
+        else: self.files = self._root.glob(f"p*/*_{mic_id}.{audio_ext}")
+        # Sort before the empty check: glob returns a generator, which is
+        # always truthy; sorted() materializes it into a checkable list.
+        self.files = sorted(self.files, key=lambda p: os.path.getsize(p))
         if not self.files: raise FileNotFoundError(f"No {audio_ext} under {self._root}")
 
     def __len__(self) -> int:

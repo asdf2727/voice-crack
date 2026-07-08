@@ -15,14 +15,14 @@ import torch.nn as nn
 
 class STFTEncoder(nn.Module):
     def __init__(self, hop: int, win_chunks: int = 1,
-                 window: Callable[[int], torch.Tensor] = torch.hann_window):
+                 window: Callable[[int], torch.Tensor] = torch.hamming_window):
         super().__init__()
         self.hop = hop
         self.n_fft = win_chunks * hop
         self.register_buffer("window", window(self.n_fft))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.view_as_real(torch.stft(
+    def stft(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.stft(
             x,
             self.n_fft,
             self.hop,
@@ -31,18 +31,42 @@ class STFTEncoder(nn.Module):
             center=False,
             onesided=True,
             return_complex=True
-        ).transpose(-1, -2))
+        )
+
+    @staticmethod
+    def to_real(x: torch.Tensor) -> torch.Tensor:
+        """complex (B?, F, T) -> real (B?, T, 2F), re/im interleaved per bin."""
+        return torch.view_as_real(x.transpose(-1, -2)).flatten(-2)
+
+    @staticmethod
+    def compress(c: torch.Tensor, exp: float = 0.3, eps: float = 1e-8) -> torch.Tensor:
+        # eps keeps silent bins finite: without it, mag 0 -> 0 * 0^(exp-1) = NaN.
+        return c * (c.abs() + eps).pow(exp - 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.to_real(self.compress(self.stft(x)))
 
 class STFTDecoder(nn.Module):
     def __init__(self, enc: STFTEncoder):
         super().__init__()
         self.hop = enc.hop
         self.n_fft = enc.n_fft
-        self.window = enc.window
+        self.register_buffer("window", enc.window.clone())
 
-    def forward(self, x: torch.Tensor, length: int | None = None) -> torch.Tensor:
+    @staticmethod
+    def to_complex(x: torch.Tensor) -> torch.Tensor:
+        """real (B?, T, 2F) -> complex (B?, F, T). The dtype view must happen
+        while the interleaved re/im pairs sit contiguously in the last dim --
+        transposing first would pair floats along the wrong axis."""
+        return x.view(torch.cfloat).transpose(-1, -2)
+
+    @staticmethod
+    def decompress(c: torch.Tensor, exp: float = 0.3, eps: float = 1e-8) -> torch.Tensor:
+        return c * (c.abs() + eps).pow(1 / exp - 1)
+
+    def istft(self, x: torch.Tensor, length: int | None = None) -> torch.Tensor:
         return torch.istft(
-            torch.view_as_complex(x).transpose(-1, -2),
+            x,
             self.n_fft,
             self.hop,
             self.n_fft,
@@ -52,20 +76,20 @@ class STFTDecoder(nn.Module):
             length=length
         )
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.istft(self.decompress(self.to_complex(x)))
+
 from matplotlib import pyplot as plt
 import numpy as np
 
 def show_spec(spec: torch.Tensor):
-    spec_np = spec.numpy(force=True)
-    spec_np = spec_np.transpose(1, 0, 2)
-    spec_complex = spec_np[..., 0] + 1j * spec_np[..., 1]
-    mag = np.abs(spec_complex)
-    phase = np.angle(spec_complex)
+    spec_np = STFTDecoder.to_complex(spec).numpy(force=True)
+    mag = np.abs(spec_np)
+    phase = np.angle(spec_np)
     sin_p = (np.sin(phase) + 1) / 2
     cos_p = (np.cos(phase) + 1) / 2
-    log_mag = np.log(mag + 1e-8)
-    log_mag_norm = (log_mag - log_mag.min()) / (log_mag.max() - log_mag.min())
-    phase_rgb = np.stack([sin_p * log_mag_norm, log_mag_norm, cos_p * log_mag_norm], axis=-1)
+    mag_norm = (mag - mag.min()) / (mag.max() - mag.min())
+    phase_rgb = np.stack([sin_p * mag_norm, mag_norm, cos_p * mag_norm], axis=-1)
 
     h, w = phase_rgb.shape[:2]
     dpi = 100
@@ -74,3 +98,52 @@ def show_spec(spec: torch.Tensor):
     ax.set_axis_off()
     ax.imshow(phase_rgb, origin="lower", interpolation="none")
     plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Self-test: shapes, NaN-safety on silence, exact round-trips.
+# ---------------------------------------------------------------------------
+
+def _selftest():
+    torch.manual_seed(0)
+    sr = 16000
+    # hamming, not the default hann: center=False istft needs a strictly
+    # positive overlap-add envelope, and hann's zero endpoints violate it.
+    enc = STFTEncoder(hop=128, win_chunks=4, window=torch.hamming_window)  # n_fft 512
+    dec = STFTDecoder(enc)
+
+    t = torch.arange(sr) / sr
+    wave = torch.stack([0.5 * torch.sin(2 * torch.pi * 440.0 * t),
+                        0.1 * torch.randn(sr)])
+
+    spec = enc(wave)
+    bins = enc.n_fft // 2 + 1
+    n_frames = (sr - enc.n_fft) // enc.hop + 1
+    assert spec.shape == (2, n_frames, 2 * bins), spec.shape
+    assert spec.dtype == torch.float32
+
+    # Silence must not produce NaNs (compression at mag = 0).
+    assert not enc(torch.zeros(1, sr)).isnan().any(), "NaN on silent input"
+
+    # to_real / to_complex are exact inverses (pure layout changes).
+    c = enc.stft(wave)
+    assert torch.equal(dec.to_complex(enc.to_real(c)), c)
+
+    # compress / decompress round-trip.
+    cc = dec.decompress(enc.compress(c))
+    assert (cc - c).abs().max() < 1e-3 * c.abs().max(), (cc - c).abs().max()
+
+    # Full wave round-trip; istft(center=False) yields n_fft + (T-1)*hop samples.
+    n = enc.n_fft + (n_frames - 1) * enc.hop
+    err = (dec(spec) - wave[:, :n]).abs().max().item()
+    assert err < 1e-3, err
+
+    # Unbatched (S,) path works end to end.
+    assert dec(enc(wave[0])).shape == (n,)
+
+    print(f"stft selftest OK: {tuple(wave.shape)} -> {tuple(spec.shape)} "
+          f"-> roundtrip max err {err:.2e}")
+
+
+if __name__ == "__main__":
+    _selftest()
