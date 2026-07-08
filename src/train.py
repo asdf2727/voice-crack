@@ -8,7 +8,11 @@ Pipeline per step, everything (B, T, C):
     x -> TCNEncoder.encode -> per-frame (mean, log_var) -> reparameterized z
     z -> TCNDecoder -> recon (B, T - enc.latency - dec.latency, 2F)
 
-Loss: summed-MSE reconstruction against the latency-cropped input (valid
+Waveforms are RMS-normalized before the STFT (same at inference; the gain is
+re-applied outside the model), so the spectral loss's absolute floor and the
+compression knee see a stable scale without any dataset preprocessing.
+
+Loss: spectral mag + k_phase * phase against the latency-cropped input (valid
 convs eat frames off the front, so recon frame 0 corresponds to input frame
 enc.latency + dec.latency) + kld_scale * KL against the EMA ARD prior, which
 is updated every step from the sampled latents. kld_scale ramps linearly over
@@ -28,8 +32,8 @@ from torch.utils.data import DataLoader
 from datasets.batched import BatchCropDataset
 from datasets.vctk import VCTKDataset
 from loss.ard_prior import ARDPrior
-from loss.vae_loss import autoencoder_loss, kld_loss
-from models.STFT import STFTEncoder
+from loss.vae_loss import kld_loss, spectral_loss
+from models.STFT import STFTEncoder, rms_normalize
 from models.ae import TCNDecoder, TCNEncoder
 
 
@@ -43,6 +47,7 @@ def train(enc: TCNEncoder,
           device: torch.device,
           lr: float = 1e-3,
           warmup: int | None = None,
+          k_phase: float = 1.0,
           save: str | None = None) -> list[dict]:
     enc.to(device)
     dec.to(device)
@@ -56,13 +61,13 @@ def train(enc: TCNEncoder,
         scale = kld_scale * min(1.0, (epoch + 1) / warmup) if warmup else kld_scale
         enc.train()
         dec.train()
-        ae_sum = kld_sum = n = skipped = 0
+        mag_sum = phs_sum = kld_sum = n = skipped = 0
         t0 = time.time()
 
         for wave in loader:
             wave = wave.to(device, non_blocking=True)
+            wave, _ = rms_normalize(wave)  # gain not needed: loss lives in normalized space
             x = stft(wave)
-            #print(f"Batch {n}: {x.shape[-2]} chunks of size {x.shape[-1]}")
             if x.shape[-2] <= crop:  # sorted-by-length: earliest batches are shortest
                 skipped += 1
                 continue
@@ -70,25 +75,29 @@ def train(enc: TCNEncoder,
             mean, log_var = enc.encode(x)
             z = enc.reparameterize(mean, log_var)
             recon = dec(z)
-            ae = autoencoder_loss(x[..., crop:, :], recon)
+            mag, phs = spectral_loss(recon, x[..., crop:, :])
             kld = kld_loss(mean, log_var, prior.get_var)
-            loss = ae + scale * kld
+            loss = mag + k_phase * phs + scale * kld
 
             opt.zero_grad()
             loss.backward()
             opt.step()
 
             prior.collect_and_update(z)
-            ae_sum += ae.item()
+            mag_sum += mag.item()
+            phs_sum += phs.item()
             kld_sum += kld.item()
             n += 1
 
         rel = prior.relevant_dims()
-        stats = {"epoch": epoch, "ae": ae_sum / max(n, 1), "kld": kld_sum / max(n, 1),
+        n = max(n, 1)
+        stats = {"epoch": epoch, "ae": (mag_sum + k_phase * phs_sum) / n,
+                 "mag": mag_sum / n, "phase": phs_sum / n, "kld": kld_sum / n,
                  "kld_scale": scale, "relevant": len(rel), "skipped": skipped}
         history.append(stats)
-        print(f"epoch {epoch:3d} | ae {stats['ae']:10.2f} | kld {stats['kld']:9.2f} "
-              f"(x{scale:.3f}) | relevant dims {len(rel)}/{prior.var.numel()} "
+        print(f"epoch {epoch:3d} | mag {stats['mag']:9.2f} | phs {stats['phase']:9.2f} "
+              f"(x{k_phase:.2f}) | kld {stats['kld']:9.2f} (x{scale:.3f}) "
+              f"| relevant dims {len(rel)}/{prior.var.numel()} "
               f"| prior var [{prior.var.min():.4f}, {prior.var.max():.4f}] "
               f"| {time.time() - t0:.1f}s"
               + (f" | {skipped} too-short batches skipped" if skipped else ""))
@@ -135,16 +144,16 @@ def _selftest(device: torch.device):
     enc = TCNEncoder(in_ch, hidden=64, latent_dim=16, blocks=3, kernel=5)
     dec = TCNDecoder(in_ch, latent_dim=16, hidden=64, blocks=3, kernel=5)
     prior = ARDPrior(16, halflife=20_000.0)
-    history = train(enc, dec, prior, stft, loader, epochs=10, lr=1e-3,
+    history = train(enc, dec, prior, stft, loader, epochs=25, lr=1e-3,
                     kld_scale=1.0, warmup=3, device=device)
 
     first, last = history[0]["ae"], history[-1]["ae"]
     assert last < first, f"recon did not improve: {first:.1f} -> {last:.1f}"
     with torch.no_grad():
-        x = stft(next(iter(loader)).to(device))
-        crop = enc.latency + dec.latency
-        silence = autoencoder_loss(x[..., crop:, :],
-                                   torch.zeros_like(x[..., crop:, :])).item()
+        x = stft(rms_normalize(next(iter(loader)).to(device))[0])
+        xc = x[..., enc.latency + dec.latency:, :]
+        m, ph = spectral_loss(torch.zeros_like(xc), xc)
+        silence = (m + ph).item()
     assert last < 0.7 * silence, f"no better than silence: {last:.1f} vs {silence:.1f}"
     assert not torch.allclose(prior.var, torch.ones_like(prior.var)), \
         "prior never updated"
@@ -168,6 +177,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--kld-scale", type=float, default=1.0,
                     help="weight of the KL term (paper's beta); tune on recon quality")
+    ap.add_argument("--k-phase", type=float, default=1.0,
+                    help="weight of the phase-alignment term in spectral_loss")
     ap.add_argument("--warmup", type=int, default=5,
                     help="epochs of linear KL ramp-up (0 = none)")
     ap.add_argument("--halflife", type=float, default=1e6,
@@ -176,7 +187,7 @@ def main():
                     help="crop cap per batch; peak GPU memory is linear in this "
                          "(~3.4 GiB per 5.3s at the default model size)")
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--save", type=str, default="../checkpoints/tcn_ardvae.pt")
+    ap.add_argument("--save", type=str, default="../models/tcn_ardvae.pt")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -208,8 +219,8 @@ def main():
           f"in_ch {in_ch} | latency {lat} frames ({lat * args.hop / sr:.3f}s) | {device}")
 
     train(enc, dec, prior, stft, loader, epochs=args.epochs, lr=args.lr,
-          kld_scale=args.kld_scale, warmup=args.warmup, device=device,
-          save=args.save)
+          kld_scale=args.kld_scale, warmup=args.warmup, k_phase=args.k_phase,
+          device=device, save=args.save)
 
 
 if __name__ == "__main__":

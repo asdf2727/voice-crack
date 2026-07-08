@@ -13,6 +13,16 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
+
+def rms_normalize(wave: torch.Tensor, target: float = 0.1,
+                  min_rms: float = 1e-3) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scale each waveform (..., S) to RMS `target`; undo with `out / gain`.
+    min_rms caps the boost so near-silence isn't amplified to speech level."""
+    rms = wave.square().mean(dim=-1, keepdim=True).sqrt()
+    gain = target / rms.clamp_min(min_rms)
+    return wave * gain, gain
+
+
 class STFTEncoder(nn.Module):
     def __init__(self, hop: int, win_chunks: int = 1,
                  window: Callable[[int], torch.Tensor] = torch.hamming_window):
@@ -39,9 +49,12 @@ class STFTEncoder(nn.Module):
         return torch.view_as_real(x.transpose(-1, -2)).flatten(-2)
 
     @staticmethod
-    def compress(c: torch.Tensor, exp: float = 0.3, eps: float = 1e-8) -> torch.Tensor:
-        # eps keeps silent bins finite: without it, mag 0 -> 0 * 0^(exp-1) = NaN.
-        return c * (c.abs() + eps).pow(exp - 1)
+    def compress(c: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Magnitude r -> log1p(r), phase kept. Slope 1 at r = 0 (silent bins
+        map to ~themselves, no noise-floor amplification like power < 1) and
+        log at the top (dynamic-range squash); knee at r ~ 1."""
+        mag = c.abs()
+        return c * mag.log1p() / (mag + eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.to_real(self.compress(self.stft(x)))
@@ -61,8 +74,10 @@ class STFTDecoder(nn.Module):
         return x.view(torch.cfloat).transpose(-1, -2)
 
     @staticmethod
-    def decompress(c: torch.Tensor, exp: float = 0.3, eps: float = 1e-8) -> torch.Tensor:
-        return c * (c.abs() + eps).pow(1 / exp - 1)
+    def decompress(c: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Exact inverse of STFTEncoder.compress: magnitude m -> expm1(m)."""
+        mag = c.abs()
+        return c * mag.expm1() / (mag + eps)
 
     def istft(self, x: torch.Tensor, length: int | None = None) -> torch.Tensor:
         return torch.istft(
@@ -140,6 +155,11 @@ def _selftest():
 
     # Unbatched (S,) path works end to end.
     assert dec(enc(wave[0])).shape == (n,)
+
+    # Normalization: rows land on the target RMS, near-silence isn't boosted.
+    norm, gain = rms_normalize(wave)
+    assert (norm.square().mean(-1).sqrt() - 0.1).abs().max() < 1e-4
+    assert rms_normalize(torch.full((100,), 1e-6))[1].item() <= 100.0
 
     print(f"stft selftest OK: {tuple(wave.shape)} -> {tuple(spec.shape)} "
           f"-> roundtrip max err {err:.2e}")

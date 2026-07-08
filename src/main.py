@@ -13,6 +13,7 @@ def rand_phase(spec: torch.Tensor) -> torch.Tensor:
 
 def run_model(enc, dec, spec: torch.Tensor) -> torch.Tensor:
     #return spec
+    #return rand_phase(spec)
     return dec(enc(spec))
 
 def check_strides(x: torch.Tensor):
@@ -50,7 +51,7 @@ def build_from_checkpoint(ckpt: str, hop: int) -> tuple[TCNEncoder, TCNDecoder]:
 def main():
     chunk_size = 256
 
-    enc, dec = build_from_checkpoint("../checkpoints/tcn_ardvae.pt", chunk_size)
+    enc, dec = build_from_checkpoint("../models/tcn_ardvae.pt", chunk_size)
 
     stft = STFTEncoder(chunk_size, 4, window=torch.hamming_window)
     istft = STFTDecoder(stft)
@@ -61,7 +62,10 @@ def main():
 
     print("playing original...")
     file = FileSource(ds.get_path(idx), 0.05)
-    spec = stft.forward(torch.from_numpy(file.get_wav()))
+    # Same normalization as training; the model works in normalized space and
+    # the gain is re-applied to its output.
+    wav, gain = rms_normalize(torch.from_numpy(file.get_wav()))
+    spec = stft.forward(wav)
     check_strides(spec)
     show_spec(spec[enc.latency + dec.latency :, :])
     DeviceSink.dump_source(file)
@@ -72,7 +76,7 @@ def main():
     print("playing reconstructed...")
     check_strides(out_spec)
     show_spec(out_spec)
-    out_wav = istft.forward(out_spec).numpy(force=True)
+    out_wav = (istft.forward(out_spec) / gain).numpy(force=True)
     out_wav = out_wav[:len(out_wav)//chunk_size * chunk_size].reshape(-1, chunk_size)
     with DeviceSink(chunk_size, sr=file.sample_rate()) as sink:
         for chunk in out_wav:
