@@ -57,7 +57,7 @@ class TCNEncoder(nn.Module):
         return self.reparameterize(mean, log_var) if self.training else mean
 
 class TCNDecoder(nn.Module):
-    def __init__(self, out_ch: int, latent_dim: int = 64, hidden: int | None = None,
+    def __init__(self, out_ch: int, hidden: int | None = None, latent_dim: int = 64,
                  blocks: int = 6, kernel: int = 3):
         super().__init__()
         hidden = hidden or out_ch
@@ -82,8 +82,8 @@ class TCNDecoder(nn.Module):
 def _selftest():
     torch.manual_seed(0)
     B, T, F2, L = 2, 60, 66, 16
-    enc = TCNEncoder(F2, hidden=48, latent_dim=L, blocks=3, kernel=3)
-    dec = TCNDecoder(F2, latent_dim=L, hidden=48, blocks=3, kernel=3)
+    enc = TCNEncoder(F2, latent_dim=L, blocks=3, kernel=3)
+    dec = TCNDecoder(F2, latent_dim=L, blocks=3, kernel=3)
 
     # Valid convs eat frames off the front: recon frame 0 corresponds to
     # input frame enc.latency + dec.latency (the reconstruction target must

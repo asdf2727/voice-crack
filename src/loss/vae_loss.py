@@ -1,136 +1,181 @@
 """
-ARD-VAE loss terms (arXiv:2501.10901), ported to PyTorch from the reference
-TensorFlow implementation (github.com/Surojit-Utah/ARD-VAE, loss/vae_loss.py).
+Variational bottleneck priors (ARD-VAE, arXiv:2501.10901).
 
-The bottleneck KL is taken against a zero-mean Gaussian prior whose per-axis
-variance `var` is estimated from the encoded data (see loss.ard_prior.ARDPrior)
-instead of the fixed N(0, I) of a vanilla VAE. Axes the model doesn't need get
-their prior variance driven toward zero, which is what makes the effective
-dimensionality readable.
+Each prior owns its closed-form diagonal-Gaussian KL and an EMA estimate of
+the aggregate posterior, updated every step from (mean, log_var) -- the exact
+per-sample second moment mu^2 + sigma^2, i.e. the paper's sampled-z update
+with the sampling noise integrated out. `halflife` is measured in samples
+(latent frames): the prior must move on a much slower timescale than SGD or
+axes ratchet into premature collapse.
 
-Shape convention: batch-first, latent axis last -- mean/log_var are (B, L) or
-(B, T, L); var is (L,). Losses are summed over all non-batch dims and
-averaged over the batch, so with per-frame latents the KL sums over time just
-like the reconstruction sums over frames -- the two terms stay on comparable
-scales regardless of crop length.
+Shape convention: latent axis last, time axis before it -- mean/log_var are
+(T, L) or (B, T, L). KLs are summed over T and L and averaged over the batch;
+unbatched input behaves as a batch of one.
 """
 import torch
+from torch import nn
 
 
-def kld_loss(mean: torch.Tensor, log_var: torch.Tensor, var: torch.Tensor,
-             eps: float = 1e-8) -> torch.Tensor:
-    """KL( N(mean, exp(log_var)) || N(0, var) ), per-axis diagonal Gaussians.
-
-    The reference implementation adds `var` where the exact KL has `log(var)`;
-    both are constant w.r.t. the encoder so gradients are identical -- we keep
-    the exact form so the reported value is a true KL. The eps clamp keeps a
-    fully collapsed axis (var -> 0) from turning the loss into inf/NaN.
-    """
-    v = var.clamp_min(eps).view(*([1] * (mean.dim() - 1)), -1)
-    kld = 0.5 * (v.log() - log_var - 1.0 + (mean.square() + log_var.exp()) / v)
-    return kld.flatten(1).sum(dim=1).mean()
+def _top_frac(stat: torch.Tensor, frac: float) -> torch.Tensor:
+    """Indices holding `frac` of stat's total, largest first (all if degenerate)."""
+    order = stat.argsort(descending=True)
+    total = stat.sum()
+    if total <= 0:
+        return order
+    csum = stat[order].cumsum(0) / total
+    return order[:int((csum < frac).sum().item()) + 1]
 
 
-def kld_loss_wo_const(mean: torch.Tensor, log_var: torch.Tensor, var: torch.Tensor,
-                      eps: float = 1e-8) -> torch.Tensor:
-    """kld_loss minus the terms constant w.r.t. the encoder (same gradients)."""
-    v = var.clamp_min(eps).view(*([1] * (mean.dim() - 1)), -1)
-    kld = 0.5 * (-log_var + (mean.square() + log_var.exp()) / v)
-    return kld.flatten(1).sum(dim=1).mean()
+class LatentPrior(nn.Module):
+    def kld_loss(self, mean: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """KL( N(mean, exp(log_var)) || prior )"""
+        ...
+    def kld_rel_loss(self, mean: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """kld_loss minus the terms constant w.r.t. the encoder (same gradients)."""
+        ...
+    def update(self, mean: torch.Tensor, log_var: torch.Tensor, eps: float = 1e-8):
+        """Adapt the prior / relevance statistics to the encoded data."""
+        ...
+    def relevant_dims(self, frac: float = 1) -> torch.Tensor:
+        """Indices of the axes explaining `frac` of the relevance statistic,
+        most relevant first."""
+        ...
+    @property
+    def var(self) -> torch.Tensor:
+        """Per-axis variance summary, for logging."""
+        ...
 
 
-def autoencoder_loss(x: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
-    """Squared error summed over all non-batch dims, averaged over the batch."""
-    return (x - recon).flatten(1).square().sum(dim=1).mean()
+class UnitPrior(LatentPrior):
+    """Fixed N(0, I) prior; tracks E[mu^2] per axis (the signal part of the
+    aggregate posterior variance) for relevance reporting only."""
+
+    def __init__(self, latent_dim: int, halflife: float = 1000000.0):
+        super().__init__()
+        self._latent_dim = latent_dim
+        self.halflife = halflife
+        self.register_buffer("mean_sq", torch.ones(latent_dim))  # EMA of E[mu^2]
+
+    def kld_loss(self, mean: torch.Tensor, log_var: torch.Tensor):
+        kld = 0.5 * (mean.square() + log_var.exp() - 1.0 - log_var)
+        return kld.flatten(-2).sum(dim=-1).mean()
+
+    def kld_rel_loss(self, mean: torch.Tensor, log_var: torch.Tensor):
+        kld = 0.5 * (mean.square() + log_var.exp() - log_var)
+        return kld.flatten(-2).sum(dim=-1).mean()
+
+    @torch.no_grad()
+    def update(self, mean: torch.Tensor, log_var: torch.Tensor, eps: float = 1e-8):
+        keep = 0.5 ** (mean[..., 0].numel() / self.halflife)
+        sq = mean.square().flatten(0, -2).mean(dim=0)
+        self.mean_sq = (keep * self.mean_sq + (1 - keep) * sq).clamp_min(eps)
+
+    def relevant_dims(self, frac: float = 1) -> torch.Tensor:
+        return _top_frac(self.mean_sq, frac)
+
+    @property
+    def var(self) -> torch.Tensor:
+        return self.mean_sq
 
 
-def spectral_loss(p: torch.Tensor, t: torch.Tensor, floor: float = 0.3,
-                  eps: float = 1e-12) -> tuple[torch.Tensor, torch.Tensor]:
-    """Amplitude + phase-alignment loss on interleaved re/im spectra (B, T, 2F).
+class ScaledPrior(LatentPrior):
+    """ARD prior N(0, v) with v tracking the aggregate posterior second moment
+    E[mu^2 + sigma^2] (the conjugate update's beta/alpha, Rao-Blackwellized).
+    Relevance per axis is v / E[sigma^2] - 1 = E[mu^2] / E[sigma^2], a
+    signal-to-posterior-noise ratio: 0 for collapsed axes."""
 
-    Per complex bin:  mag   = (|p| - |t|)^2
-                      phase = |t|^2 - |t| * dot(p, t) / (|p| + floor)
-    Combine as mag + K * phase; returned separately for logging.
+    def __init__(self, latent_dim: int, halflife: float = 1000000.0):
+        super().__init__()
+        self._latent_dim = latent_dim
+        self.halflife = halflife
+        self.register_buffer("prior_var", torch.ones(latent_dim))     # EMA of E[mu^2 + sigma^2]
+        self.register_buffer("post_var_mean", torch.ones(latent_dim)) # EMA of E[sigma^2]
 
-    Random-phase optimum of |p| stays |t| (no MSE-style collapse); aligned
-    bins overshoot by ~K*floor/2, additive, so relatively vanishing for loud
-    bins. `floor` is an absolute predicted-energy floor: below it, phase
-    supervision becomes a pull toward the target direction, and phase of
-    near-silent targets is unsupervised. The absolute scale is meaningful
-    because waveforms are rms_normalize'd before the STFT.
-    """
-    p2, t2 = p.unflatten(-1, (-1, 2)), t.unflatten(-1, (-1, 2))
-    mp = (p2.square().sum(-1) + eps).sqrt()  # eps keeps |p| differentiable at 0
-    mt2 = t2.square().sum(-1)
-    mt = (mt2 + eps).sqrt()
-    dot = (p2 * t2).sum(-1)
-    mag = (mp - mt).square()
-    phase = mt2 - mt * dot / (mp + floor)
-    return mag.flatten(1).sum(-1).mean(), phase.flatten(1).sum(-1).mean()
+    def kld_loss(self, mean: torch.Tensor, log_var: torch.Tensor):
+        v = self.prior_var.view(*([1] * (mean.dim() - 1)), -1)
+        kld = 0.5 * (v.log() - log_var - 1.0 + (mean.square() + log_var.exp()) / v)
+        return kld.flatten(-2).sum(dim=-1).mean()
+
+    def kld_rel_loss(self, mean: torch.Tensor, log_var: torch.Tensor):
+        v = self.prior_var.view(*([1] * (mean.dim() - 1)), -1)
+        kld = 0.5 * (-log_var + (mean.square() + log_var.exp()) / v)
+        return kld.flatten(-2).sum(dim=-1).mean()
+
+    @torch.no_grad()
+    def update(self, mean: torch.Tensor, log_var: torch.Tensor, eps: float = 1e-8):
+        keep = 0.5 ** (mean[..., 0].numel() / self.halflife)
+        sq = mean.square().flatten(0, -2).mean(dim=0)
+        var = log_var.exp().flatten(0, -2).mean(dim=0)
+        self.prior_var = (keep * self.prior_var + (1 - keep) * (sq + var)).clamp_min(eps)
+        self.post_var_mean = (keep * self.post_var_mean + (1 - keep) * var).clamp_min(eps)
+
+    def relevant_dims(self, frac: float = 1) -> torch.Tensor:
+        return _top_frac((self.prior_var / self.post_var_mean - 1.0).clamp_min(0), frac)
+
+    @property
+    def var(self) -> torch.Tensor:
+        return self.prior_var
 
 
 # ---------------------------------------------------------------------------
-# Self-test: checks the KL against hand-derived closed forms.
+# Self-test: closed forms, rel-loss gradients, EMA updates, relevance order.
 # ---------------------------------------------------------------------------
 
 def _selftest():
+    import math
     torch.manual_seed(0)
-    B, L, T = 5, 7, 11
+    B, T, L = 5, 11, 7
+    mean, log_var = torch.randn(B, T, L), torch.randn(B, T, L)
 
-    # var = 1 -> unit-variance prior -> must equal the textbook
-    # KL(N(mu, s^2) || N(0, 1)) = 0.5 * sum(mu^2 + s^2 - 1 - log s^2).
-    mean, log_var = torch.randn(B, L), torch.randn(B, L)
-    got = kld_loss(mean, log_var, torch.ones(L))
-    want = (0.5 * (mean.square() + log_var.exp() - 1.0 - log_var)).sum(1).mean()
-    assert torch.allclose(got, want, atol=1e-5), (got, want)
+    # UnitPrior == textbook KL(N(mu, s^2) || N(0, 1)); ScaledPrior agrees
+    # while its variance is still 1.
+    unit, scaled = UnitPrior(L), ScaledPrior(L)
+    want = (0.5 * (mean.square() + log_var.exp() - 1.0 - log_var)).flatten(1).sum(1).mean()
+    assert torch.allclose(unit.kld_loss(mean, log_var), want, atol=1e-5)
+    assert torch.allclose(scaled.kld_loss(mean, log_var), want, atol=1e-4)
+
+    # Unbatched (T, L) == batch of one: batched KL is the mean of per-item KLs.
+    per_item = torch.stack([unit.kld_loss(mean[b], log_var[b]) for b in range(B)])
+    assert torch.allclose(per_item.mean(), want, atol=1e-5)
 
     # KL of the prior against itself is zero.
-    var = torch.rand(L) + 0.1
-    zero = kld_loss(torch.zeros(1, L), var.log().unsqueeze(0), var)
+    scaled.prior_var = torch.rand(L) + 0.1
+    zero = scaled.kld_loss(torch.zeros(1, 1, L),
+                           scaled.prior_var.log().expand(1, 1, L))
     assert abs(zero.item()) < 1e-5, zero.item()
 
-    # A collapsed axis must stay finite (eps clamp).
-    assert kld_loss(mean, log_var, torch.zeros(L)).isfinite()
+    # rel_loss differs from the full KL by a constant -> identical gradients.
+    for prior in (unit, scaled):
+        m1 = mean.clone().requires_grad_(True)
+        lv1 = log_var.clone().requires_grad_(True)
+        prior.kld_loss(m1, lv1).backward()
+        m2 = mean.clone().requires_grad_(True)
+        lv2 = log_var.clone().requires_grad_(True)
+        prior.kld_rel_loss(m2, lv2).backward()
+        assert torch.allclose(m1.grad, m2.grad, atol=1e-6)
+        assert torch.allclose(lv1.grad, lv2.grad, atol=1e-6)
 
-    # (B, T, L) reduces like T stacked (B, L) problems, summed over time.
-    mean3, log_var3 = torch.randn(B, T, L), torch.randn(B, T, L)
-    got3 = kld_loss(mean3, log_var3, var)
-    per_frame = torch.stack([kld_loss(mean3[:, t], log_var3[:, t], var)
-                             for t in range(T)]).sum()
-    assert torch.allclose(got3, per_frame, atol=1e-4), (got3, per_frame)
+    # update() tracks E[mu^2 + sigma^2] without retaining the autograd graph.
+    true_std = torch.tensor([3.0, 2.0, 1.0, 0.5, 0.01, 0.01, 0.01])
+    scaled = ScaledPrior(L, halflife=500.0)
+    for _ in range(80):
+        m = (torch.randn(64, L) * true_std).requires_grad_(True)
+        lv = torch.full((64, L), -2.0, requires_grad=True)
+        scaled.update(m, lv)
+    assert scaled.prior_var.grad_fn is None, "update leaked the graph"
+    want_var = true_std.square() + math.exp(-2.0)
+    assert ((scaled.prior_var - want_var).abs() / want_var).max() < 0.2
 
-    # wo_const differs from the exact KL by a constant -> identical gradients.
-    m1 = mean3.clone().requires_grad_(True)
-    lv1 = log_var3.clone().requires_grad_(True)
-    kld_loss(m1, lv1, var).backward()
-    m2 = mean3.clone().requires_grad_(True)
-    lv2 = log_var3.clone().requires_grad_(True)
-    kld_loss_wo_const(m2, lv2, var).backward()
-    assert torch.allclose(m1.grad, m2.grad, atol=1e-6)
-    assert torch.allclose(lv1.grad, lv2.grad, atol=1e-6)
+    # Relevance: signal axes first (largest E[mu^2]/E[sigma^2]), noise-only
+    # axes excluded below frac.
+    dims = scaled.relevant_dims(0.995)
+    assert dims[0].item() == 0, dims
+    assert set(dims.tolist()) == {0, 1, 2, 3}, dims
 
-    # Reconstruction: summed squares over features, mean over batch -- for any
-    # trailing shape, incl. the 4D (B, T, F, 2) complex-as-real STFT layout.
-    x, y = torch.randn(B, T, 3), torch.randn(B, T, 3)
-    assert torch.allclose(autoencoder_loss(x, y),
-                          (x - y).square().sum() / B, atol=1e-5)
-    x4, y4 = torch.randn(B, T, 3, 2), torch.randn(B, T, 3, 2)
-    assert torch.allclose(autoencoder_loss(x4, y4),
-                          (x4 - y4).square().sum() / B, atol=1e-5)
-
-    # spectral_loss: under random phase the total is minimized at |p| = |t|
-    # (plain MSE would collapse to 0), and the pull at p = 0 stays finite.
-    thetas = torch.rand(4096) * 2 * torch.pi
-    ts = torch.stack([5 * thetas.cos(), 5 * thetas.sin()], -1)  # (n, 2)
-    def total(mp):
-        ps = torch.zeros_like(ts)
-        ps[:, 0] = mp
-        m, ph = spectral_loss(ps, ts)
-        return (m + ph).item()
-    assert min((0.0, 2.5, 5.0, 7.5), key=total) == 5.0
-    p0 = torch.zeros(1, 2, requires_grad=True)
-    spectral_loss(p0, torch.tensor([[3.0, 4.0]]))[1].backward()
-    assert p0.grad.isfinite().all()
+    unit = UnitPrior(L, halflife=500.0)
+    for _ in range(80):
+        unit.update(torch.randn(64, L) * true_std, torch.zeros(64, L))
+    assert set(unit.relevant_dims(0.995).tolist()) == {0, 1, 2, 3}
 
     print("vae_loss selftest OK")
 

@@ -26,20 +26,19 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
 from torch.utils.data import DataLoader
 
 from datasets.batched import BatchCropDataset
 from datasets.vctk import VCTKDataset
-from loss.ard_prior import ARDPrior
-from loss.vae_loss import kld_loss, spectral_loss
+from loss.vae_loss import *
+from loss.stft_loss import spectral_loss
 from models.STFT import STFTEncoder, rms_normalize
 from models.ae import TCNDecoder, TCNEncoder
 
 
 def train(enc: TCNEncoder,
           dec: TCNDecoder,
-          prior: ARDPrior,
+          prior: LatentPrior,
           stft: STFTEncoder,
           loader,
           epochs: int,
@@ -73,17 +72,17 @@ def train(enc: TCNEncoder,
                 continue
 
             mean, log_var = enc.encode(x)
+            prior.update(mean, log_var)
             z = enc.reparameterize(mean, log_var)
             recon = dec(z)
             mag, phs = spectral_loss(recon, x[..., crop:, :])
-            kld = kld_loss(mean, log_var, prior.get_var)
+            kld = prior.kld_loss(mean, log_var)
             loss = mag + k_phase * phs + scale * kld
 
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-            prior.collect_and_update(z)
             mag_sum += mag.item()
             phs_sum += phs.item()
             kld_sum += kld.item()
@@ -143,7 +142,7 @@ def _selftest(device: torch.device):
 
     enc = TCNEncoder(in_ch, hidden=64, latent_dim=16, blocks=3, kernel=5)
     dec = TCNDecoder(in_ch, latent_dim=16, hidden=64, blocks=3, kernel=5)
-    prior = ARDPrior(16, halflife=20_000.0)
+    prior = ScaledPrior(16, halflife=20_000.0)
     history = train(enc, dec, prior, stft, loader, epochs=25, lr=1e-3,
                     kld_scale=1.0, warmup=3, device=device)
 
@@ -209,7 +208,7 @@ def main():
                      blocks=args.blocks, kernel=args.kernel)
     dec = TCNDecoder(in_ch, latent_dim=args.latent, hidden=args.hidden,
                      blocks=args.blocks, kernel=args.kernel)
-    prior = ARDPrior(args.latent, halflife=args.halflife)
+    prior = ScaledPrior(args.latent, halflife=args.halflife)
 
     if args.save:
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)

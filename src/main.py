@@ -4,7 +4,7 @@ from datasets.vctk import VCTKDataset
 
 from models.STFT import *
 from models.ae import *
-from loss.ard_prior import ARDPrior
+from loss.vae_loss import ScaledPrior
 
 
 def rand_phase(spec: torch.Tensor) -> torch.Tensor:
@@ -33,7 +33,7 @@ def build_from_checkpoint(ckpt: str, hop: int) -> tuple[TCNEncoder, TCNDecoder]:
                      blocks=enc_blocks, kernel=kernel)
     dec = TCNDecoder(in_ch, latent_dim=latent, hidden=dec_sd["dec_in.weight"].shape[0],
                      blocks=dec_blocks, kernel=kernel)
-    prior = ARDPrior(enc.latent_dim)
+    prior = ScaledPrior(enc.latent_dim)
 
     enc.load_state_dict(enc_sd)
     dec.load_state_dict(dec_sd)
