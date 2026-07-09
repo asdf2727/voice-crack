@@ -186,6 +186,9 @@ def main():
                     help="crop cap per batch; peak GPU memory is linear in this "
                          "(~3.4 GiB per 5.3s at the default model size)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--init", type=str, default=None,
+                    help="checkpoint (.pt) to start from; loads enc/dec/prior "
+                         "(fresh optimizer). Architecture flags must match.")
     ap.add_argument("--save", type=str, default="../models/tcn_ardvae.pt")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -209,6 +212,13 @@ def main():
     dec = TCNDecoder(in_ch, latent_dim=args.latent, hidden=args.hidden,
                      blocks=args.blocks, kernel=args.kernel)
     prior = ScaledPrior(args.latent, halflife=args.halflife)
+
+    if args.init:
+        ckpt = torch.load(args.init, map_location="cpu")
+        enc.load_state_dict(ckpt["enc"])
+        dec.load_state_dict(ckpt["dec"])
+        prior.load_state_dict(ckpt["prior"])
+        print(f"initialized from {args.init} (epoch {ckpt['stats']['epoch']})")
 
     if args.save:
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)

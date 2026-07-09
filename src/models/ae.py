@@ -53,8 +53,7 @@ class TCNEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean, log_var = self.encode(x)
-        # Sample at train time, z = mean at inference.
-        return self.reparameterize(mean, log_var) if self.training else mean
+        return self.reparameterize(mean, log_var)
 
 class TCNDecoder(nn.Module):
     def __init__(self, out_ch: int, hidden: int | None = None, latent_dim: int = 64,

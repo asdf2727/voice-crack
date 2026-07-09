@@ -36,7 +36,7 @@ class LatentPrior(nn.Module):
     def update(self, mean: torch.Tensor, log_var: torch.Tensor, eps: float = 1e-8):
         """Adapt the prior / relevance statistics to the encoded data."""
         ...
-    def relevant_dims(self, frac: float = 1) -> torch.Tensor:
+    def relevant_dims(self, frac: float = 0.99) -> torch.Tensor:
         """Indices of the axes explaining `frac` of the relevance statistic,
         most relevant first."""
         ...
@@ -70,7 +70,7 @@ class UnitPrior(LatentPrior):
         sq = mean.square().flatten(0, -2).mean(dim=0)
         self.mean_sq = (keep * self.mean_sq + (1 - keep) * sq).clamp_min(eps)
 
-    def relevant_dims(self, frac: float = 1) -> torch.Tensor:
+    def relevant_dims(self, frac: float = 0.99) -> torch.Tensor:
         return _top_frac(self.mean_sq, frac)
 
     @property
@@ -109,7 +109,7 @@ class ScaledPrior(LatentPrior):
         self.prior_var = (keep * self.prior_var + (1 - keep) * (sq + var)).clamp_min(eps)
         self.post_var_mean = (keep * self.post_var_mean + (1 - keep) * var).clamp_min(eps)
 
-    def relevant_dims(self, frac: float = 1) -> torch.Tensor:
+    def relevant_dims(self, frac: float = 0.99) -> torch.Tensor:
         return _top_frac((self.prior_var / self.post_var_mean - 1.0).clamp_min(0), frac)
 
     @property

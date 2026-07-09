@@ -1,25 +1,33 @@
+from torch._dynamo.variables import torch
+
 from audio.device_stream import *
 from audio.file_stream import FileSource
 from datasets.vctk import VCTKDataset
 
 from models.STFT import *
 from models.ae import *
-from loss.vae_loss import ScaledPrior
+from loss.vae_loss import ScaledPrior, LatentPrior
 
 
 def rand_phase(spec: torch.Tensor) -> torch.Tensor:
     mag = STFTDecoder.to_complex(spec).abs()
     return STFTEncoder.to_real(mag * torch.exp((2j * np.pi) * torch.rand_like(mag)))
 
-def run_model(enc, dec, spec: torch.Tensor) -> torch.Tensor:
-    #return spec
-    #return rand_phase(spec)
-    return dec(enc(spec))
+def run_encoder(enc: TCNEncoder, prior: LatentPrior, spec: torch.Tensor) -> torch.Tensor:
+    return enc(spec)[..., prior.relevant_dims()]
+
+def run_decoder(dec: TCNDecoder, prior: LatentPrior, latent: torch.Tensor) -> torch.Tensor:
+    rel = prior.relevant_dims()
+    mask = torch.ones_like(prior.var)
+    mask[rel] = 0
+    mean = torch.zeros((latent.shape[0], prior.var.shape[0]))
+    mean[..., rel] = latent
+    return dec(TCNEncoder.reparameterize(mean, prior.var * mask))
 
 def check_strides(x: torch.Tensor):
     print(f"shape {tuple(x.shape)} - stride - {x.stride()} - cont? {x.is_contiguous()}")
 
-def build_from_checkpoint(ckpt: str, hop: int) -> tuple[TCNEncoder, TCNDecoder]:
+def build_from_checkpoint(ckpt: str, hop: int) -> tuple[TCNEncoder, TCNDecoder, LatentPrior]:
     ckpt = torch.load(ckpt, map_location='cpu')
 
     enc_sd, dec_sd = ckpt["enc"], ckpt["dec"]
@@ -46,12 +54,12 @@ def build_from_checkpoint(ckpt: str, hop: int) -> tuple[TCNEncoder, TCNDecoder]:
 
     enc.eval()  # z = mean, deterministic
     dec.eval()
-    return enc, dec
+    return enc, dec, prior
 
 def main():
     chunk_size = 256
 
-    enc, dec = build_from_checkpoint("../models/tcn_ardvae.pt", chunk_size)
+    enc, dec, prior = build_from_checkpoint("../models/tcn_ardvae.pt", chunk_size)
 
     stft = STFTEncoder(chunk_size, 4, window=torch.hamming_window)
     istft = STFTDecoder(stft)
@@ -71,7 +79,9 @@ def main():
     DeviceSink.dump_source(file)
 
     print("running model...")
-    out_spec = run_model(enc, dec, spec)
+    latent = run_encoder(enc, prior, spec)
+    print(latent.shape)
+    out_spec = run_decoder(dec, prior, latent)
 
     print("playing reconstructed...")
     check_strides(out_spec)
