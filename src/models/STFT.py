@@ -1,13 +1,3 @@
-"""
-Everything here follows the tensor shape contract `(B?, T, C)` where:
-
-- B: optional batch size
-- T: time axis
-- C: channels
-
-Note: This is the transpose of the usual CNN shape convention `(B, C, T)`.
-"""
-
 from typing import Callable
 
 import torch
@@ -45,8 +35,8 @@ class STFTEncoder(nn.Module):
 
     @staticmethod
     def to_real(x: torch.Tensor) -> torch.Tensor:
-        """complex (B?, F, T) -> real (B?, T, 2F), re/im interleaved per bin."""
-        return torch.view_as_real(x.transpose(-1, -2)).flatten(-2)
+        """complex (B?, F, T) -> real (B?, 2, T, F)"""
+        return torch.view_as_real(x).transpose(-1, -3)
 
     @staticmethod
     def compress(c: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -68,10 +58,9 @@ class STFTDecoder(nn.Module):
 
     @staticmethod
     def to_complex(x: torch.Tensor) -> torch.Tensor:
-        """real (B?, T, 2F) -> complex (B?, F, T). The dtype view must happen
-        while the interleaved re/im pairs sit contiguously in the last dim --
-        transposing first would pair floats along the wrong axis."""
-        return x.view(torch.cfloat).transpose(-1, -2)
+        """real (B?, 2, T, F) -> complex (B?, F, T). view_as_complex needs the
+        (re, im) pairs contiguous in the last dim, hence transpose + copy."""
+        return torch.view_as_complex(x.transpose(-1, -3).contiguous())
 
     @staticmethod
     def decompress(c: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -134,8 +123,9 @@ def _selftest():
     spec = enc(wave)
     bins = enc.n_fft // 2 + 1
     n_frames = (sr - enc.n_fft) // enc.hop + 1
-    assert spec.shape == (2, n_frames, 2 * bins), spec.shape
+    assert spec.shape == (2, 2, n_frames, bins), spec.shape  # (B, re/im, T, F)
     assert spec.dtype == torch.float32
+    assert enc(wave[0]).shape == (2, n_frames, bins)  # unbatched channel map
 
     # Silence must not produce NaNs (compression at mag = 0).
     assert not enc(torch.zeros(1, sr)).isnan().any(), "NaN on silent input"
