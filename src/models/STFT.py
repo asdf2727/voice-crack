@@ -21,6 +21,10 @@ class STFTEncoder(nn.Module):
         self.n_fft = win_chunks * hop
         self.register_buffer("window", window(self.n_fft))
 
+    @property
+    def out_freqs(self) -> int:
+        return self.n_fft // 2 + 1
+
     def stft(self, x: torch.Tensor) -> torch.Tensor:
         return torch.stft(
             x,
@@ -56,6 +60,10 @@ class STFTDecoder(nn.Module):
         self.n_fft = enc.n_fft
         self.register_buffer("window", enc.window.clone())
 
+    @property
+    def in_freq(self) -> int:
+        return self.n_fft // 2 + 1
+
     @staticmethod
     def to_complex(x: torch.Tensor) -> torch.Tensor:
         """real (B?, 2, T, F) -> complex (B?, F, T). view_as_complex needs the
@@ -86,15 +94,19 @@ class STFTDecoder(nn.Module):
 from matplotlib import pyplot as plt
 import numpy as np
 
-def show_spec(spec: torch.Tensor):
+def spec_rgb(spec: torch.Tensor) -> np.ndarray:
+    """(2, T, F) channel map -> (F, T, 3) RGB: brightness = magnitude, color = phase."""
     spec_np = STFTDecoder.to_complex(spec).numpy(force=True)
     mag = np.abs(spec_np)
     phase = np.angle(spec_np)
     sin_p = (np.sin(phase) + 1) / 2
     cos_p = (np.cos(phase) + 1) / 2
-    mag_norm = (mag - mag.min()) / (mag.max() - mag.min())
-    phase_rgb = np.stack([sin_p * mag_norm, mag_norm, cos_p * mag_norm], axis=-1)
+    mag_norm = (mag - mag.min()) / (mag.max() - mag.min() + 1e-12)
+    return np.stack([sin_p * mag_norm, mag_norm, cos_p * mag_norm], axis=-1)
 
+
+def show_spec(spec: torch.Tensor):
+    phase_rgb = spec_rgb(spec)
     h, w = phase_rgb.shape[:2]
     dpi = 100
     fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)

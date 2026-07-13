@@ -12,6 +12,7 @@ Note: Large parts of this file were copied over and modified from the open ConvN
 found at: https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
 """
 
+import math
 import torch
 import torch.nn as nn
 
@@ -20,10 +21,14 @@ class ConvNeXtBlock(nn.Module):
     r""" ConvNeXt Block. Adapted to be causal over time (dim -2): frequency is
     same-padded, time is valid, and the residual drops the first `latency`
     frames to match.
+
+    - Parameters: `channels * (kernel[0] * kernel[1] + 2 * bottleneck)`
+    - Macs per timestep: `freq * parameters`
+
     Args:
-        channels (int): Number of input channels.
+        channels (int): Number of input and output channels.
         kernel_size (int | tuple(int, int)): Size of the convolving kernel. Assumed square if given int.
-        bottleneck (int): Hidden width of the pointwise MLP. Default: `4 * channels`
+        bottleneck (int): Hidden width of the pointwise MLP. Default: `4 * sqrt(in * out channels)`
         layer_scale (float): Init scale of the residual branch. Default: 1e-6.
     """
     def __init__(
@@ -32,7 +37,7 @@ class ConvNeXtBlock(nn.Module):
             kernel_size: int | tuple[int, int] = 7,
             bottleneck: int | None = None,
             layer_scale: float = 1e-6):
-        bottleneck = bottleneck or 4 * channels
+        bottleneck = bottleneck or int(4 * channels)
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
 

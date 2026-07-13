@@ -50,10 +50,9 @@ class UnitPrior(LatentPrior):
     """Fixed N(0, I) prior; tracks E[mu^2] per axis (the signal part of the
     aggregate posterior variance) for relevance reporting only."""
 
-    def __init__(self, latent_dim: int, halflife: float = 1000000.0):
+    def __init__(self, latent_dim: int):
         super().__init__()
         self._latent_dim = latent_dim
-        self.halflife = halflife
         self.register_buffer("mean_sq", torch.ones(latent_dim))  # EMA of E[mu^2]
 
     def kld_loss(self, mean: torch.Tensor, log_var: torch.Tensor):
@@ -65,8 +64,8 @@ class UnitPrior(LatentPrior):
         return kld.flatten(-2).sum(dim=-1).mean()
 
     @torch.no_grad()
-    def update(self, mean: torch.Tensor, log_var: torch.Tensor, eps: float = 1e-8):
-        keep = 0.5 ** (mean[..., 0].numel() / self.halflife)
+    def update(self, mean: torch.Tensor, log_var: torch.Tensor, halflife = 1e6, eps: float = 1e-8):
+        keep = 0.5 ** (mean[..., 0].numel() / halflife)
         sq = mean.square().flatten(0, -2).mean(dim=0)
         self.mean_sq = (keep * self.mean_sq + (1 - keep) * sq).clamp_min(eps)
 
@@ -84,10 +83,9 @@ class ScaledPrior(LatentPrior):
     Relevance per axis is v / E[sigma^2] - 1 = E[mu^2] / E[sigma^2], a
     signal-to-posterior-noise ratio: 0 for collapsed axes."""
 
-    def __init__(self, latent_dim: int, halflife: float = 1000000.0):
+    def __init__(self, latent_dim: int):
         super().__init__()
         self._latent_dim = latent_dim
-        self.halflife = halflife
         self.register_buffer("prior_var", torch.ones(latent_dim))     # EMA of E[mu^2 + sigma^2]
         self.register_buffer("post_var_mean", torch.ones(latent_dim)) # EMA of E[sigma^2]
 
@@ -102,8 +100,8 @@ class ScaledPrior(LatentPrior):
         return kld.flatten(-2).sum(dim=-1).mean()
 
     @torch.no_grad()
-    def update(self, mean: torch.Tensor, log_var: torch.Tensor, eps: float = 1e-8):
-        keep = 0.5 ** (mean[..., 0].numel() / self.halflife)
+    def update(self, mean: torch.Tensor, log_var: torch.Tensor, halflife = 1e6, eps: float = 1e-8):
+        keep = 0.5 ** (mean[..., 0].numel() / halflife)
         sq = mean.square().flatten(0, -2).mean(dim=0)
         var = log_var.exp().flatten(0, -2).mean(dim=0)
         self.prior_var = (keep * self.prior_var + (1 - keep) * (sq + var)).clamp_min(eps)
@@ -157,11 +155,11 @@ def _selftest():
 
     # update() tracks E[mu^2 + sigma^2] without retaining the autograd graph.
     true_std = torch.tensor([3.0, 2.0, 1.0, 0.5, 0.01, 0.01, 0.01])
-    scaled = ScaledPrior(L, halflife=500.0)
+    scaled = ScaledPrior(L)
     for _ in range(80):
         m = (torch.randn(64, L) * true_std).requires_grad_(True)
         lv = torch.full((64, L), -2.0, requires_grad=True)
-        scaled.update(m, lv)
+        scaled.update(m, lv, halflife=500.0)
     assert scaled.prior_var.grad_fn is None, "update leaked the graph"
     want_var = true_std.square() + math.exp(-2.0)
     assert ((scaled.prior_var - want_var).abs() / want_var).max() < 0.2
@@ -172,9 +170,9 @@ def _selftest():
     assert dims[0].item() == 0, dims
     assert set(dims.tolist()) == {0, 1, 2, 3}, dims
 
-    unit = UnitPrior(L, halflife=500.0)
+    unit = UnitPrior(L)
     for _ in range(80):
-        unit.update(torch.randn(64, L) * true_std, torch.zeros(64, L))
+        unit.update(torch.randn(64, L) * true_std, torch.zeros(64, L), halflife=500.0)
     assert set(unit.relevant_dims(0.995).tolist()) == {0, 1, 2, 3}
 
     print("vae_loss selftest OK")

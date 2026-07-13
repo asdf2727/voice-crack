@@ -16,7 +16,7 @@ crop offsets are re-rolled on every access.
 """
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 
 class BatchCropDataset(Dataset):
@@ -48,6 +48,23 @@ class BatchCropDataset(Dataset):
             start = rng.integers(len(w) - n + 1)
             out[j] = w[start:start + n]
         return torch.from_numpy(out)
+
+
+class InfiniteBatchCrops(IterableDataset):
+    """Endless uniformly-random batches (with replacement) from a
+    BatchCropDataset, for generation-based training. Each DataLoader worker
+    samples independently (seed offset by worker id)."""
+
+    def __init__(self, batches: BatchCropDataset, seed: int | None = None):
+        self._batches = batches
+        self.seed = seed
+
+    def __iter__(self):
+        info = get_worker_info()
+        seed = None if self.seed is None else self.seed + (info.id if info else 0)
+        rng = np.random.default_rng(seed)
+        while True:
+            yield self._batches[int(rng.integers(len(self._batches)))]
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +113,14 @@ def _selftest():
     # max_samples caps every batch, and rows are still contiguous slices.
     capped = BatchCropDataset(ds, batch_size=B, max_samples=100)
     assert all(capped[i].shape == (B, 100) for i in range(len(capped)))
+
+    # Infinite sampler: valid batch shapes forever; the batch-index sequence
+    # is deterministic per seed (crop offsets still re-roll).
+    import itertools
+    inf = list(itertools.islice(iter(InfiniteBatchCrops(batches, seed=1)), 8))
+    inf2 = list(itertools.islice(iter(InfiniteBatchCrops(batches, seed=1)), 8))
+    assert all(b.shape[0] == B for b in inf)
+    assert [tuple(a.shape) for a in inf] == [tuple(c.shape) for c in inf2]
 
     print(f"batched selftest OK: {len(batches)} batches of {B}, "
           f"shortest {batches[0].shape[1]} / longest {batches[last].shape[1]} samples")

@@ -1,114 +1,191 @@
 """
-Train the causal TCN autoencoder (Vocos-style blocks) with an ARD-VAE
-bottleneck on complex STFTs of VCTK.
+Train the causal ConvNeXt autoencoder with an ARD-VAE bottleneck on complex
+STFTs of VCTK -- generation-based.
 
-Pipeline per step, everything (B, T, C):
+A Runner (run.py) owns the model bundle (STFT pair, encoder/decoder, prior,
+config); the Trainer owns the optimization: an infinite random-batch loader,
+`generations` optimizer steps, per-batch loss rows appended to <save>.csv,
+a stats line + target-vs-recon PNG every `viz_every` generations or on Enter,
+and checkpoints on 's' + Enter (plus at run end). Epochs survive only as a
+fractional progress reference. --compile wraps the encode/decode hot paths.
 
-    wave (B, S) -> STFTEncoder -> x (B, T, 2F) compressed complex STFT
-    x -> TCNEncoder.encode -> per-frame (mean, log_var) -> reparameterized z
-    z -> TCNDecoder -> recon (B, T - enc.latency - dec.latency, 2F)
-
-Waveforms are RMS-normalized before the STFT (same at inference; the gain is
-re-applied outside the model), so the spectral loss's absolute floor and the
-compression knee see a stable scale without any dataset preprocessing.
-
-Loss: spectral mag + k_phase * phase against the latency-cropped input (valid
-convs eat frames off the front, so recon frame 0 corresponds to input frame
-enc.latency + dec.latency) + kld_scale * KL against the EMA ARD prior, which
-is updated every step from the sampled latents. kld_scale ramps linearly over
---warmup epochs so axes can't collapse before the encoder learns anything.
-
-    python train.py --root ../datasets/VCTK-Corpus-0.92
+    python train.py --root ../datasets/VCTK-Corpus-0.92 --compile
     python train.py --selftest        # synthetic tones, no VCTK needed
 """
 import argparse
+import csv
+import select
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-from datasets.batched import BatchCropDataset
+from datasets.batched import BatchCropDataset, InfiniteBatchCrops
 from datasets.vctk import VCTKDataset
 from loss.vae_loss import *
 from loss.stft_loss import spectral_loss
-from models.STFT import STFTEncoder, rms_normalize
-from models.ae import TCNDecoder, TCNEncoder
+from models.STFT import spec_rgb
+from models.ae import BlockParams
+from run import Runner
 
 
-def train(enc: TCNEncoder,
-          dec: TCNDecoder,
-          prior: LatentPrior,
-          stft: STFTEncoder,
-          loader,
-          epochs: int,
-          kld_scale: float,
-          device: torch.device,
-          lr: float = 1e-3,
-          warmup: int | None = None,
-          k_phase: float = 1.0,
-          config: dict | None = None,
-          save: str | None = None) -> list[dict]:
-    enc.to(device)
-    dec.to(device)
-    prior.to(device)
-    stft.to(device)
-    opt = torch.optim.Adam([*enc.parameters(), *dec.parameters()], lr=lr)
-    crop = enc.latency + dec.latency
+class Trainer:
+    def __init__(self,
+                 runner: Runner,
+                 halflife: float = 1e6,
+                 compile_model: bool = True,
+                 save: str | Path | None = None):
+        self.runner = runner
+        self.halflife = halflife
+        self.save_path = Path(save) if save else None
+        # compile the hot paths only; state_dicts stay on the eager modules
+        self._encode = (torch.compile(runner.enc.encode, dynamic=True)
+                        if compile_model else runner.enc.encode)
+        self._decode = (torch.compile(runner.dec, dynamic=True)
+                        if compile_model else runner.dec)
+        self.crop = runner.enc.latency + runner.dec.latency
+        self.history: list[dict] = []
+        # run-scoped knobs, refreshed by run(); kept on self for viz/baseline
+        self.k_phase = 1.0
+        self.k_vae = 1.0
+        self.viz_every = 200
+        self.batches_per_epoch = None
+        self._last = None  # (target, recon) of the newest batch, for the viz PNG
+        self._mark = (0, time.time())  # (generation, wall time) of the last viz
+        self._stdin_ok = sys.stdin is not None and not sys.stdin.closed
+        self._csv = self._writer = None
 
-    history = []
-    for epoch in range(epochs):
-        scale = kld_scale * min(1.0, (epoch + 1) / warmup) if warmup else kld_scale
-        enc.train()
-        dec.train()
-        mag_sum = phs_sum = kld_sum = n = skipped = 0
-        t0 = time.time()
+    def epoch(self, gen: int) -> float:
+        """Fractional epochs seen after `gen` generations (progress reference)."""
+        return gen / self.batches_per_epoch if self.batches_per_epoch else float("nan")
 
-        for wave in loader:
-            wave = wave.to(device, non_blocking=True)
-            wave, _ = rms_normalize(wave)  # gain not needed: loss lives in normalized space
-            x = stft(wave)
-            if x.shape[-2] <= crop:  # sorted-by-length: earliest batches are shortest
-                skipped += 1
-                continue
+    def features(self, wave: torch.Tensor) -> torch.Tensor:
+        """wave (B, S) -> (B, 2, T, F) in the model band, normalized."""
+        return self.runner.wave_to_spec(wave)[1]
 
-            mean, log_var = enc.encode(x)
-            prior.update(mean, log_var)
-            z = enc.reparameterize(mean, log_var)
-            recon = dec(z)
-            # Target cropped in time (latency) AND frequency: the valid-conv
-            # top-band drop is not reconstructed, so it isn't penalized.
-            mag, phs = spectral_loss(recon, x[..., crop:, :recon.shape[-1]])
-            kld = prior.kld_loss(mean, log_var)
-            loss = mag + k_phase * phs + scale * kld
+    def train_batch(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        mean, log_var = self._encode(x)
+        self.runner.prior.update(mean, log_var, self.halflife)
+        recon = self._decode(self.runner.enc.reparameterize(mean, log_var))
+        target = x[..., self.crop:, :]
+        mag, phs = spectral_loss(recon, target)
+        kld = self.runner.prior.kld_loss(mean, log_var)
+        self._last = (target.detach(), recon.detach())
+        return mag, phs, kld
 
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+    def run(self,
+            generations: int,
+            loader: DataLoader,
+            lr: float = 1e-3,
+            k_phase: float = 1.0,
+            k_vae: float = 1.0,
+            vae_warmup: int = 0,
+            viz_every: int = 200,
+            batches_per_epoch: int | None = None) -> list[dict]:
+        opt = torch.optim.Adam([*self.runner.enc.parameters(),
+                                    *self.runner.dec.parameters()], lr=lr, fused=True)
+        self.k_phase, self.k_vae = k_phase, k_vae
+        self.viz_every = viz_every
+        self.batches_per_epoch = batches_per_epoch
+        if self.save_path and self._csv is None:
+            self._csv = open(self.save_path.with_suffix(".csv"), "w", newline="")
+            self._writer = csv.writer(self._csv)
+            self._writer.writerow(["gen", "epoch", "mag_loss", "phs_loss",
+                                   "vae_loss", "vae_mult"])
 
-            mag_sum += mag.item()
-            phs_sum += phs.item()
-            kld_sum += kld.item()
-            n += 1
+        self.runner.enc.train()
+        self.runner.dec.train()
+        batches = iter(loader)
+        try:
+            for gen in range(generations):
+                x = self.features(next(batches))
+                if x.shape[-2] <= self.crop:
+                    continue
 
-        rel = prior.relevant_dims()
-        n = max(n, 1)
-        stats = {"epoch": epoch, "ae": (mag_sum + k_phase * phs_sum) / n,
-                 "mag": mag_sum / n, "phase": phs_sum / n, "kld": kld_sum / n,
-                 "kld_scale": scale, "relevant": len(rel), "skipped": skipped}
-        history.append(stats)
-        print(f"epoch {epoch:3d} | mag {stats['mag']:9.2f} | phs {stats['phase']:9.2f} "
-              f"(x{k_phase:.2f}) | kld {stats['kld']:9.2f} (x{scale:.3f}) "
-              f"| relevant dims {len(rel)}/{prior.var.numel()} "
-              f"| prior var [{prior.var.min():.4f}, {prior.var.max():.4f}] "
-              f"| {time.time() - t0:.1f}s"
-              + (f" | {skipped} too-short batches skipped" if skipped else ""))
+                mag_loss, phs_loss, vae_loss = self.train_batch(x)
+                vae_mult = gen / vae_warmup if gen < vae_warmup else 1
+                total_loss = mag_loss + k_phase * phs_loss + (k_vae * vae_mult) * vae_loss
+                opt.zero_grad()
+                total_loss.backward()
+                opt.step()
 
-        if save:
-            torch.save({"enc": enc.state_dict(), "dec": dec.state_dict(),
-                        "prior": prior.state_dict(), "opt": opt.state_dict(),
-                        "config": config, "stats": stats}, save)
-    return history
+                stats = {
+                    "gen": gen,
+                    "epoch": round(self.epoch(gen), 4),
+                    "mag_loss": mag_loss.item(),
+                    "phs_loss": phs_loss.item(),
+                    "vae_loss": vae_loss.item(),
+                    "vae_mult": vae_mult,
+                }
+                self.history.append(stats)
+                if self._writer:
+                    self._writer.writerow(stats.values())
+                if viz_every and (gen + 1) % viz_every == 0:
+                    self.viz(gen + 1)
+                self.poll_input(gen + 1)
+        finally:
+            self.save()
+            if self._csv:
+                self._csv.close()
+                self._csv = self._writer = None
+        return self.history
+
+    def poll_input(self, gen: int) -> None:
+        """Non-blocking stdin: Enter -> viz now, 's' + Enter -> checkpoint."""
+        while self._stdin_ok and select.select([sys.stdin], [], [], 0)[0]:
+            line = sys.stdin.readline()
+            if line == "":  # EOF: stdin is not interactive, stop polling
+                self._stdin_ok = False
+                break
+            if line.strip().lower() == "s":
+                self.save()
+                print(f"gen {gen}: checkpoint saved to {self.save_path}")
+            self.viz(gen)
+
+    def viz(self, gen: int) -> None:
+        window = self.history[-min(len(self.history), self.viz_every or 100):]
+        mean = {k: sum(r[k] for r in window) / len(window)
+                for k in ("mag_loss", "phs_loss", "vae_loss")}
+        mark_gen, mark_t = self._mark
+        rate = (gen - mark_gen) / max(time.time() - mark_t, 1e-9)
+        self._mark = (gen, time.time())
+        prior = self.runner.prior
+        print(f"gen {gen} (epoch {self.epoch(gen):.3f}) "
+              f"| mag {mean['mag_loss']:9.2f} "
+              f"| phs {mean['phs_loss']:9.2f} (x{self.k_phase:.2f}) "
+              f"| vae {mean['vae_loss']:9.2f} "
+              f"(x{self.k_vae * self.history[-1]['vae_mult']:.3f}) "
+              f"| relevant dims {len(prior.relevant_dims())}/{prior.var.numel()} "
+              f"| {rate:.1f} gen/s")
+        if self.save_path and self._last:
+            target, recon = self._last
+            top, bottom = spec_rgb(target[0])[::-1], spec_rgb(recon[0])[::-1]
+            sep = np.ones((2, top.shape[1], 3))
+            plt.imsave(self.save_path.with_suffix(".png"),
+                       np.concatenate([top, sep, bottom]).clip(0.0, 1.0))
+        if self._csv:
+            self._csv.flush()
+
+    def silence_baseline(self, batches) -> float:
+        """Average loss of predicting zeros over a finite batch iterable."""
+        tot = n = 0
+        with torch.no_grad():
+            for wave in batches:
+                x = self.features(wave)
+                if x.shape[-2] <= self.crop:
+                    continue
+                xc = x[..., self.crop:, :]
+                m, ph = spectral_loss(torch.zeros_like(xc), xc)
+                tot += (m + self.k_phase * ph).item()
+                n += 1
+        return tot / max(n, 1)
+
+    def save(self) -> None:
+        if self.save_path:
+            self.runner.save_model(self.save_path)
 
 
 # ---------------------------------------------------------------------------
@@ -138,69 +215,64 @@ class _SortedTones:
 def _selftest(device: torch.device):
     torch.manual_seed(0)
     sr = 8000
-    stft = STFTEncoder(hop=64, win_chunks=4)  # n_fft 256
-    bins = stft.n_fft // 2 + 1
-    loader = DataLoader(BatchCropDataset(_SortedTones(48, sr), batch_size=8),
-                        batch_size=None, shuffle=True)
+    batches = BatchCropDataset(_SortedTones(48, sr), batch_size=8)
+    loader = DataLoader(InfiniteBatchCrops(batches, seed=0), batch_size=None)
 
-    enc = TCNEncoder(bins, latent_dim=16, depths=(2, 2), base=8, kernel=5)
-    dec = TCNDecoder(bins, latent_dim=16, depths=(2, 2), base=8, kernel=5)
-    prior = ScaledPrior(16, halflife=20_000.0)
-    history = train(enc, dec, prior, stft, loader, epochs=60, lr=2e-3,
-                    kld_scale=1.0, warmup=3, device=device)
+    # stride=1 first stage = pointwise stem + full-resolution blocks: phase
+    # needs fine-frequency capacity (see findings log).
+    blocks = [BlockParams(8, depth=2, kernel=5, stride=1),
+              BlockParams(16, depth=2, kernel=5)]
+    runner = Runner.new_sym_model(blocks, latent_dim=16, stft_hop=64,
+                                  stft_win_chunks=4, device=device)
+    trainer = Trainer(runner, lr=2e-3, halflife=20_000.0)
+    history = trainer.run(360, loader, k_phase=1.0, k_vae=1.0, vae_warmup=18,
+                          viz_every=60, batches_per_epoch=len(batches))
 
-    first, last = history[0]["ae"], history[-1]["ae"]
+    ae = [r["mag_loss"] + r["phs_loss"] for r in history]
+    first, last = np.mean(ae[:30]), np.mean(ae[-60:])
     assert last < first, f"recon did not improve: {first:.1f} -> {last:.1f}"
-    # Silence baseline averaged over the same batches as the training epochs
-    # (batch lengths vary, a single batch is not comparable). At this model
-    # scale the phase term stays near its baseline; the bound tracks mag.
-    crop = enc.latency + dec.latency
-    tot = n = 0
-    with torch.no_grad():
-        for wave in loader:
-            x = stft(rms_normalize(wave.to(device))[0])
-            if x.shape[-2] <= crop:
-                continue
-            xc = x[..., crop:, :dec.out_freq]
-            m, ph = spectral_loss(torch.zeros_like(xc), xc)
-            tot += (m + ph).item()
-            n += 1
-    silence = tot / n
+    silence = trainer.silence_baseline(batches[i] for i in range(len(batches)))
     assert last < 0.75 * silence, f"no better than silence: {last:.1f} vs {silence:.1f}"
+    prior = runner.prior
     assert not torch.allclose(prior.var, torch.ones_like(prior.var)), \
         "prior never updated"
     print(f"train selftest OK: ae {first:.1f} -> {last:.1f} "
           f"(silence baseline {silence:.1f}), "
-          f"{history[-1]['relevant']}/16 relevant dims")
+          f"{len(prior.relevant_dims())}/16 relevant dims")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--root", type=str, default="../datasets/VCTK-Corpus-0.92")
     ap.add_argument("--mic", type=str, default="any")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--generations", type=int, default=20_000)
+    ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--hop", type=int, default=256)
     ap.add_argument("--win-chunks", type=int, default=4, help="n_fft = win_chunks * hop")
     ap.add_argument("--latent", type=int, default=64)
+    ap.add_argument("--channels", type=int, nargs="+", default=[8, 16, 32],
+                    help="channels per stage; each stage = Downsample + `depth` blocks")
     ap.add_argument("--depths", type=int, nargs="+", default=[2, 2, 2],
-                    help="ConvNeXt blocks per stage; stages are separated by "
-                         "Downsample/Upsample transitions")
-    ap.add_argument("--base", type=int, default=8,
-                    help="channels of the first stage (doubles per stage)")
+                    help="ConvNeXt blocks per stage (pairs with --channels)")
+    ap.add_argument("--strides", type=int, nargs="+", default=None,
+                    help="per-stage frequency stride (default 1 for the first "
+                         "stage, 2 for the rest: full-res blocks first)")
     ap.add_argument("--kernel", type=int, default=7)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--kld-scale", type=float, default=1.0,
+    ap.add_argument("--k-vae", type=float, default=1.0,
                     help="weight of the KL term (paper's beta); tune on recon quality")
     ap.add_argument("--k-phase", type=float, default=1.0,
                     help="weight of the phase-alignment term in spectral_loss")
-    ap.add_argument("--warmup", type=int, default=5,
-                    help="epochs of linear KL ramp-up (0 = none)")
+    ap.add_argument("--warmup", type=int, default=2000,
+                    help="generations of linear KL ramp-up (0 = none)")
     ap.add_argument("--halflife", type=float, default=1e6,
                     help="ARD prior EMA halflife, in latent frames")
-    ap.add_argument("--max-seconds", type=float, default=4.0,
-                    help="crop cap per batch; peak GPU memory is linear in this "
-                         "(~3.4 GiB per 5.3s at the default model size)")
+    ap.add_argument("--max-seconds", type=float, default=2.0,
+                    help="crop cap per batch; peak GPU memory is linear in batch * seconds")
+    ap.add_argument("--viz-every", type=int, default=200,
+                    help="print stats + write the recon PNG every k generations")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the encoder/decoder hot paths")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--init", type=str, default=None,
                     help="checkpoint (.pt) to start from; loads enc/dec/prior "
@@ -213,39 +285,41 @@ def main():
     if args.selftest:
         _selftest(device)
         return
+    strides = args.strides or [1] + [2] * (len(args.channels) - 1)
+    if not (len(args.channels) == len(args.depths) == len(strides)):
+        ap.error("--channels, --depths and --strides must have the same length")
 
     vctk = VCTKDataset(args.root, mic_id=args.mic)
     sr = vctk[0][1]
-    loader = DataLoader(BatchCropDataset(vctk, batch_size=args.batch,
-                                         max_samples=int(args.max_seconds * sr)),
-                        batch_size=None, shuffle=True,
-                        num_workers=args.workers, pin_memory=True)
+    batches = BatchCropDataset(vctk, batch_size=args.batch,
+                               max_samples=int(args.max_seconds * sr))
+    loader = DataLoader(InfiniteBatchCrops(batches), batch_size=None,
+                        num_workers=args.workers, pin_memory=True,
+                        persistent_workers=args.workers > 0)
 
-    stft = STFTEncoder(hop=args.hop, win_chunks=args.win_chunks)
-    bins = stft.n_fft // 2 + 1
-    config = dict(latent_dim=args.latent, depths=tuple(args.depths),
-                  base=args.base, kernel=args.kernel)
-    enc = TCNEncoder(bins, **config)
-    dec = TCNDecoder(bins, **config)
-    prior = ScaledPrior(args.latent, halflife=args.halflife)
-
+    blocks = [BlockParams(c, depth=d, kernel=args.kernel, stride=s)
+              for c, d, s in zip(args.channels, args.depths, strides)]
+    runner = Runner.new_sym_model(blocks, latent_dim=args.latent,
+                                  stft_hop=args.hop,
+                                  stft_win_chunks=args.win_chunks, device=device)
     if args.init:
-        ckpt = torch.load(args.init, map_location="cpu")
-        enc.load_state_dict(ckpt["enc"])
-        dec.load_state_dict(ckpt["dec"])
-        prior.load_state_dict(ckpt["prior"])
-        print(f"initialized from {args.init} (epoch {ckpt['stats']['epoch']})")
+        runner.load_data(torch.load(args.init, map_location=device))
+        print(f"initialized from {args.init}")
 
     if args.save:
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-    n_params = sum(p.numel() for m in (enc, dec) for p in m.parameters())
-    lat = enc.latency + dec.latency
-    print(f"{len(vctk)} utterances @ {sr} Hz | {n_params/1e6:.1f}M params | "
-          f"{bins} bins | latency {lat} frames ({lat * args.hop / sr:.3f}s) | {device}")
+    n_params = sum(p.numel() for m in (runner.enc, runner.dec) for p in m.parameters())
+    lat = runner.enc.latency + runner.dec.latency
+    print(f"{len(vctk)} utterances @ {sr} Hz ({len(batches)} batches/epoch) | "
+          f"{n_params/1e6:.2f}M params | latency {lat * args.hop / sr:.3f}s | {device}\n"
+          f"controls: Enter = viz now, s + Enter = save checkpoint")
 
-    train(enc, dec, prior, stft, loader, epochs=args.epochs, lr=args.lr,
-          kld_scale=args.kld_scale, warmup=args.warmup, k_phase=args.k_phase,
-          config=config, device=device, save=args.save)
+    trainer = Trainer(runner, halflife=args.halflife,
+                      compile_model=args.compile, save=args.save)
+    trainer.run(args.generations, loader, lr=args.lr,
+                k_phase=args.k_phase, k_vae=args.k_vae,
+                vae_warmup=args.warmup, viz_every=args.viz_every,
+                batches_per_epoch=len(batches))
 
 
 if __name__ == "__main__":
