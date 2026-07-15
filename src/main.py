@@ -20,7 +20,9 @@ def main():
     stft = STFTEncoder(chunk_size, 4, window=torch.hamming_window)
     istft = STFTDecoder(stft)
 
-    runner = Runner.load_from_file("../models/ConvNeXt_ae.pt", torch.device("cpu"))
+    runner = Runner.load_from_file("../models/tcn_ardvae.pt", torch.device("cpu"))
+    runner.enc.eval()
+    runner.dec.eval()
 
     ds = VCTKDataset("../datasets/VCTK-Corpus-0.92")
     idx = np.random.randint(len(ds))
@@ -45,6 +47,7 @@ def main():
 
     print("playing reconstructed...")
     out_wav = out_wav[:len(out_wav)//chunk_size * chunk_size].reshape(-1, chunk_size)
+    out_wav = out_wav.detach().numpy()
     with DeviceSink(chunk_size, sr=file.sample_rate()) as sink:
         for chunk in out_wav:
             sink.put_chunk(chunk)    #chunk_data = dec(spec)

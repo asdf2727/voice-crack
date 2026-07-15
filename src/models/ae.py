@@ -23,10 +23,11 @@ import sys
 import torch
 import torch.nn as nn
 
+from models.mlp import MLP
 from models.tcn import ConvNeXtBlock, Downsample, Upsample
 
 class BlockParams:
-    def __init__(self, channels: int, depth: int = 1, kernel: int | tuple[int, int] = 7, stride: int = 2):
+    def __init__(self, channels: int, depth: int = 1, kernel: int | tuple[int, int] = 5, stride: int = 2):
         self.channels = channels
         self.depth = depth
         if isinstance(kernel, int): kernel = (kernel, kernel)
@@ -34,26 +35,30 @@ class BlockParams:
         self.stride = stride
 
 class TCNEncoder(nn.Module):
-    def __init__(self, in_freq: int, blocks: list[BlockParams], latent_dim: int = 64):
+    def __init__(
+            self,
+            in_freq: int,
+            blocks: list[BlockParams],
+            latent_dim: int = 64):
         full_down = math.prod(b.stride for b in blocks)
-        if in_freq % full_down != 0:
-            old_freq, in_freq = in_freq, in_freq // full_down * full_down
-            print(f"cropping {old_freq} -> {in_freq} for input freq bin count", file=sys.stderr)
         out_freq = in_freq // full_down
+        self.in_freq = out_freq * full_down
+        if in_freq != self.in_freq:
+            print(f"cropping {in_freq} -> {self.in_freq} for input freq bin count", file=sys.stderr)
 
         super().__init__()
-        self.in_freq = in_freq
         stages: list[nn.Module] = []
         prev_channels = 2
+        scale = 1 / sum(block.depth for block in blocks)
         for block in blocks:
             stages = (stages +
                       [Downsample(prev_channels, block.channels, block.stride)] +
-                      [ConvNeXtBlock(block.channels, block.kernel) for _ in range(block.depth)])
+                      [ConvNeXtBlock(block.channels, block.kernel, layer_scale=scale) for _ in range(block.depth)])
             prev_channels = block.channels
         self.enc_tcn = nn.Sequential(*stages)
 
         feats = out_freq * prev_channels
-        self.enc_mlp = nn.Sequential(nn.Linear(feats, 2 * latent_dim))
+        self.enc_mlp = MLP(feats, latent_dim * 2)
 
     @property
     def latency(self) -> int:
@@ -75,7 +80,7 @@ class TCNEncoder(nn.Module):
         return mean + (0.5 * log_var).exp() * torch.randn_like(mean)
 
     @property
-    def latent_dim(self) -> int: return self.enc_mlp[-1].out_features // 2
+    def latent_dim(self) -> int: return self.enc_mlp.out_dim // 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean, log_var = self.encode(x)
@@ -89,17 +94,17 @@ class TCNDecoder(nn.Module):
             blocks: list[BlockParams],
             out_freq: int):
         full_up = math.prod(b.stride for b in reversed(blocks))
-        if out_freq % full_up != 0:
-            old_freq, out_freq = out_freq, out_freq // full_up * full_up
-            print(f"cropping {old_freq} -> {out_freq} for output freq bin count", file=sys.stderr)
         in_freq = out_freq // full_up
+        self.out_freq = in_freq * full_up
+        if out_freq != self.out_freq:
+            print(f"cropping {out_freq} -> {self.out_freq} for output freq bin count", file=sys.stderr)
 
         super().__init__()
-        self.out_freq = out_freq
         stages: list[nn.Module] = []
         next_channels = 2
+        scale = 1 / sum(block.depth for block in blocks)
         for block in blocks:
-            stages = ([ConvNeXtBlock(block.channels, block.kernel) for _ in range(block.depth)] +
+            stages = ([ConvNeXtBlock(block.channels, block.kernel, layer_scale=scale) for _ in range(block.depth)] +
                       [Upsample(block.channels, next_channels, block.stride)] +
                       stages)
             next_channels = block.channels
@@ -107,7 +112,7 @@ class TCNDecoder(nn.Module):
 
         self._in_channels = next_channels
         feats = in_freq * next_channels
-        self.dec_mlp = nn.Sequential(nn.Linear(latent_dim, feats))
+        self.dec_mlp = MLP(latent_dim, feats)
 
     @property
     def latency(self) -> int:
@@ -155,8 +160,8 @@ def _selftest():
 
     # The shared head must receive gradient through the reparameterized sample.
     dec(enc(x)).square().sum().backward()
-    assert enc.enc_mlp[-1].weight.grad is not None
-    assert enc.enc_mlp[-1].weight.grad.abs().sum() > 0
+    assert enc.enc_mlp.seq[-1].weight.grad is not None
+    assert enc.enc_mlp.seq[-1].weight.grad.abs().sum() > 0
 
     n_params = sum(p.numel() for m in (enc, dec) for p in m.parameters())
     print(f"ae selftest OK: {n_params/1e3:.0f}K params, "

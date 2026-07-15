@@ -42,9 +42,10 @@ class Trainer:
         self.halflife = halflife
         self.save_path = Path(save) if save else None
         # compile the hot paths only; state_dicts stay on the eager modules
-        self._encode = (torch.compile(runner.enc.encode, dynamic=True)
+        torch.set_float32_matmul_precision('high')
+        self._encode = (torch.compile(runner.enc.encode)
                         if compile_model else runner.enc.encode)
-        self._decode = (torch.compile(runner.dec, dynamic=True)
+        self._decode = (torch.compile(runner.dec)
                         if compile_model else runner.dec)
         self.crop = runner.enc.latency + runner.dec.latency
         self.history: list[dict] = []
@@ -185,6 +186,7 @@ class Trainer:
 
     def save(self) -> None:
         if self.save_path:
+            print(f"saving checkpoint")
             self.runner.save_model(self.save_path)
 
 
@@ -224,9 +226,14 @@ def _selftest(device: torch.device):
               BlockParams(16, depth=2, kernel=5)]
     runner = Runner.new_sym_model(blocks, latent_dim=16, stft_hop=64,
                                   stft_win_chunks=4, device=device)
-    trainer = Trainer(runner, lr=2e-3, halflife=20_000.0)
-    history = trainer.run(360, loader, k_phase=1.0, k_vae=1.0, vae_warmup=18,
-                          viz_every=60, batches_per_epoch=len(batches))
+    # compile off: the selftest checks logic, not speed, and compilation
+    # would dominate its runtime.
+    trainer = Trainer(runner, halflife=20_000.0, compile_model=False)
+    # 800 gens: the golden-ratio MLP heads are deep (7 hidden layers at this
+    # scale) and need longer than the old single-Linear head did.
+    history = trainer.run(800, loader, lr=2e-3, k_phase=1.0, k_vae=1.0,
+                          vae_warmup=18, viz_every=200,
+                          batches_per_epoch=len(batches))
 
     ae = [r["mag_loss"] + r["phs_loss"] for r in history]
     first, last = np.mean(ae[:30]), np.mean(ae[-60:])
@@ -245,25 +252,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--root", type=str, default="../datasets/VCTK-Corpus-0.92")
     ap.add_argument("--mic", type=str, default="any")
-    ap.add_argument("--generations", type=int, default=20_000)
+    ap.add_argument("--generations", type=int, default=500_000)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--hop", type=int, default=256)
     ap.add_argument("--win-chunks", type=int, default=4, help="n_fft = win_chunks * hop")
     ap.add_argument("--latent", type=int, default=64)
-    ap.add_argument("--channels", type=int, nargs="+", default=[8, 16, 32],
-                    help="channels per stage; each stage = Downsample + `depth` blocks")
-    ap.add_argument("--depths", type=int, nargs="+", default=[2, 2, 2],
-                    help="ConvNeXt blocks per stage (pairs with --channels)")
-    ap.add_argument("--strides", type=int, nargs="+", default=None,
-                    help="per-stage frequency stride (default 1 for the first "
-                         "stage, 2 for the rest: full-res blocks first)")
     ap.add_argument("--kernel", type=int, default=7)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--k-vae", type=float, default=1.0,
                     help="weight of the KL term (paper's beta); tune on recon quality")
     ap.add_argument("--k-phase", type=float, default=1.0,
                     help="weight of the phase-alignment term in spectral_loss")
-    ap.add_argument("--warmup", type=int, default=2000,
+    ap.add_argument("--warmup", type=int, default=50000,
                     help="generations of linear KL ramp-up (0 = none)")
     ap.add_argument("--halflife", type=float, default=1e6,
                     help="ARD prior EMA halflife, in latent frames")
@@ -273,7 +273,7 @@ def main():
                     help="print stats + write the recon PNG every k generations")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the encoder/decoder hot paths")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--init", type=str, default=None,
                     help="checkpoint (.pt) to start from; loads enc/dec/prior "
                          "(fresh optimizer). Architecture flags must match.")
@@ -285,9 +285,6 @@ def main():
     if args.selftest:
         _selftest(device)
         return
-    strides = args.strides or [1] + [2] * (len(args.channels) - 1)
-    if not (len(args.channels) == len(args.depths) == len(strides)):
-        ap.error("--channels, --depths and --strides must have the same length")
 
     vctk = VCTKDataset(args.root, mic_id=args.mic)
     sr = vctk[0][1]
@@ -297,11 +294,14 @@ def main():
                         num_workers=args.workers, pin_memory=True,
                         persistent_workers=args.workers > 0)
 
-    blocks = [BlockParams(c, depth=d, kernel=args.kernel, stride=s)
-              for c, d, s in zip(args.channels, args.depths, strides)]
-    runner = Runner.new_sym_model(blocks, latent_dim=args.latent,
-                                  stft_hop=args.hop,
-                                  stft_win_chunks=args.win_chunks, device=device)
+    runner = Runner.new_sym_model([
+        BlockParams(3, depth=2, stride=1),
+        BlockParams(5, depth=2, kernel=(4, 7)),
+        BlockParams(8, depth=2, kernel=(3, 9)),
+        BlockParams(13, depth=2, kernel=(2, 11)),
+    ], latent_dim=args.latent,
+        stft_hop=args.hop,
+        stft_win_chunks=args.win_chunks, device=device)
     if args.init:
         runner.load_data(torch.load(args.init, map_location=device))
         print(f"initialized from {args.init}")
@@ -310,12 +310,12 @@ def main():
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)
     n_params = sum(p.numel() for m in (runner.enc, runner.dec) for p in m.parameters())
     lat = runner.enc.latency + runner.dec.latency
-    print(f"{len(vctk)} utterances @ {sr} Hz ({len(batches)} batches/epoch) | "
-          f"{n_params/1e6:.2f}M params | latency {lat * args.hop / sr:.3f}s | {device}\n"
-          f"controls: Enter = viz now, s + Enter = save checkpoint")
 
     trainer = Trainer(runner, halflife=args.halflife,
                       compile_model=args.compile, save=args.save)
+    print(f"{len(vctk)} utterances @ {sr} Hz ({len(batches)} batches/epoch) | "
+          f"{n_params/1e6:.2f}M params | latency {lat * args.hop / sr:.3f}s | {device}\n"
+          f"controls: Enter = viz now, s + Enter = save checkpoint")
     trainer.run(args.generations, loader, lr=args.lr,
                 k_phase=args.k_phase, k_vae=args.k_vae,
                 vae_warmup=args.warmup, viz_every=args.viz_every,
