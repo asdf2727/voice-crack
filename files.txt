@@ -1,0 +1,10 @@
+# Requirements
+voice-crack/requirements.txt >>> requirements.txt
+
+# Model weights
+#voice-crack/models/ConvNeXt_ae.pt >>> models/ConvNeXt_ae.pt
+#voice-crack/models/initial_ae.pt >>> models/initial_ae.pt
+voice-crack/models/tcn_ardvae.pt >>> models/tcn_ardvae.pt
+
+# Datasets
+#voice-crack/datasets/VCTK-Corpus-0.92 >>> datasets/VCTK-Corpus-0.92
