@@ -15,6 +15,7 @@ class MLP(nn.Module):
         layers = []
         self.dims = [in_dim]
         hidden = round(abs(math.log(in_dim / out_dim) / math.log(squeeze)))
+        hidden = 0
         for i in range(hidden):
             # round: layer widths must be ints for nn.Linear
             next_dim = round(in_dim * (out_dim / in_dim) ** ((i + 1) / (hidden + 1)))

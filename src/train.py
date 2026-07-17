@@ -27,31 +27,44 @@ from datasets.batched import BatchCropDataset, InfiniteBatchCrops
 from datasets.vctk import VCTKDataset
 from loss.vae_loss import *
 from loss.stft_loss import spectral_loss
+from loss.disc_loss import disc_loss, gen_loss
 from models.STFT import spec_rgb
-from models.ae import BlockParams
+from models.ae import BlockParams, TCNEncoder
 from run import Runner
 
 
 class Trainer:
     def __init__(self,
                  runner: Runner,
+                 disc_blocks: list[BlockParams],
                  halflife: float = 1e6,
                  compile_model: bool = True,
                  save: str | Path | None = None):
         self.runner = runner
         self.halflife = halflife
         self.save_path = Path(save) if save else None
+        # Reused-encoder critic: same trunk, latent_dim=1 -> one real/fake logit
+        # per frame (PatchGAN-style). Train-only, so it lives on the Trainer and
+        # is never checkpointed (resuming restarts it, like the fresh optimizer).
+        self.disc = TCNEncoder(self.runner.dec.out_freq, disc_blocks,
+                               latent_dim=1).to(self.runner.device)
         # compile the hot paths only; state_dicts stay on the eager modules
         torch.set_float32_matmul_precision('high')
-        self._encode = (torch.compile(runner.enc.encode)
+        self._encode = (torch.compile(runner.enc.encode, fullgraph=True)
                         if compile_model else runner.enc.encode)
-        self._decode = (torch.compile(runner.dec)
+        self._decode = (torch.compile(runner.dec, fullgraph=True)
                         if compile_model else runner.dec)
+        # encode, not the module: calling the TCNEncoder runs forward =
+        # reparameterize(mean, log_var), a stochastic sample. The critic needs
+        # the deterministic mean logit -> encode(x)[0]. (log_var head unused.)
+        self._disc = (torch.compile(self.disc.encode, fullgraph=True)
+                        if compile_model else self.disc.encode)
         self.crop = runner.enc.latency + runner.dec.latency
         self.history: list[dict] = []
         # run-scoped knobs, refreshed by run(); kept on self for viz/baseline
         self.k_phase = 1.0
         self.k_vae = 1.0
+        self.k_disc = 0.0
         self.viz_every = 200
         self.batches_per_epoch = None
         self._last = None  # (target, recon) of the newest batch, for the viz PNG
@@ -75,7 +88,7 @@ class Trainer:
         mag, phs = spectral_loss(recon, target)
         kld = self.runner.prior.kld_loss(mean, log_var)
         self._last = (target.detach(), recon.detach())
-        return mag, phs, kld
+        return mag, phs, kld, recon, target
 
     def run(self,
             generations: int,
@@ -83,19 +96,25 @@ class Trainer:
             lr: float = 1e-3,
             k_phase: float = 1.0,
             k_vae: float = 1.0,
+            k_disc: float = 0.5,
             vae_warmup: int = 0,
+            disc_warmup: int = 0,
             viz_every: int = 200,
             batches_per_epoch: int | None = None) -> list[dict]:
         opt = torch.optim.Adam([*self.runner.enc.parameters(),
                                     *self.runner.dec.parameters()], lr=lr, fused=True)
-        self.k_phase, self.k_vae = k_phase, k_vae
+        opt_d = torch.optim.Adam(self.disc.parameters(), lr=lr, fused=True)
+        self.k_phase, self.k_vae, self.k_disc = k_phase, k_vae, k_disc
         self.viz_every = viz_every
         self.batches_per_epoch = batches_per_epoch
         if self.save_path and self._csv is None:
             self._csv = open(self.save_path.with_suffix(".csv"), "w", newline="")
             self._writer = csv.writer(self._csv)
-            self._writer.writerow(["gen", "epoch", "mag_loss", "phs_loss",
-                                   "vae_loss", "vae_mult"])
+            self._writer.writerow([
+                "gen", "epoch",
+                "mag_loss", "phs_loss", "vae_loss", "disc_loss", "gen_loss",
+                "vae_mult", "disc_mult"
+            ])
 
         self.runner.enc.train()
         self.runner.dec.train()
@@ -106,9 +125,21 @@ class Trainer:
                 if x.shape[-2] <= self.crop:
                     continue
 
-                mag_loss, phs_loss, vae_loss = self.train_batch(x)
+                mag_loss, phs_loss, vae_loss, recon, target = self.train_batch(x)
                 vae_mult = gen / vae_warmup if gen < vae_warmup else 1
                 total_loss = mag_loss + k_phase * phs_loss + (k_vae * vae_mult) * vae_loss
+
+                disc_mult = gen / disc_warmup if gen < disc_warmup else 1
+                # Critic step: real target vs detached fake -> updates D only.
+                d_loss = disc_loss(self._disc(target)[0], self._disc(recon.detach())[0])
+                opt_d.zero_grad()
+                d_loss.backward()
+                opt_d.step()
+                # Generator term on the live fake: grad reaches the decoder
+                # (and D, whose stale grads are dropped at the next zero_grad).
+                g_adv = (2 * self.runner.dec.out_freq) * gen_loss(self._disc(recon)[0])
+                total_loss = total_loss + (k_disc * disc_mult) * g_adv
+
                 opt.zero_grad()
                 total_loss.backward()
                 opt.step()
@@ -119,14 +150,17 @@ class Trainer:
                     "mag_loss": mag_loss.item(),
                     "phs_loss": phs_loss.item(),
                     "vae_loss": vae_loss.item(),
+                    "disc_loss": d_loss.item(),
+                    "gen_loss": g_adv.item(),
                     "vae_mult": vae_mult,
+                    "disc_mult": disc_mult,
                 }
                 self.history.append(stats)
                 if self._writer:
                     self._writer.writerow(stats.values())
-                if viz_every and (gen + 1) % viz_every == 0:
-                    self.viz(gen + 1)
-                self.poll_input(gen + 1)
+                if viz_every and gen % viz_every == 0:
+                    self.viz(gen)
+                self.poll_input(gen)
         finally:
             self.save()
             if self._csv:
@@ -148,8 +182,8 @@ class Trainer:
 
     def viz(self, gen: int) -> None:
         window = self.history[-min(len(self.history), self.viz_every or 100):]
-        mean = {k: sum(r[k] for r in window) / len(window)
-                for k in ("mag_loss", "phs_loss", "vae_loss")}
+        keys = ["mag_loss", "phs_loss", "vae_loss", "disc_loss", "gen_loss"]
+        mean = {k: sum(r[k] for r in window) / len(window) for k in keys}
         mark_gen, mark_t = self._mark
         rate = (gen - mark_gen) / max(time.time() - mark_t, 1e-9)
         self._mark = (gen, time.time())
@@ -159,6 +193,9 @@ class Trainer:
               f"| phs {mean['phs_loss']:9.2f} (x{self.k_phase:.2f}) "
               f"| vae {mean['vae_loss']:9.2f} "
               f"(x{self.k_vae * self.history[-1]['vae_mult']:.3f}) "
+              f"| disc {mean['disc_loss']:6.3f} "
+              f"| gen {mean['gen_loss']:+6.3f} "
+              f"(x{self.k_disc * self.history[-1]['disc_mult']:.3f}) "
               f"| relevant dims {len(prior.relevant_dims())}/{prior.var.numel()} "
               f"| {rate:.1f} gen/s")
         if self.save_path and self._last:
@@ -265,6 +302,11 @@ def main():
                     help="weight of the phase-alignment term in spectral_loss")
     ap.add_argument("--warmup", type=int, default=50000,
                     help="generations of linear KL ramp-up (0 = none)")
+    ap.add_argument("--k-disc", type=float, default=1,
+                    help="weight of the hinge adversarial term on the decoder "
+                         "(0 = no discriminator).")
+    ap.add_argument("--disc-warmup", type=int, default=50000,
+                    help="generations of linear ramp on the adversarial term;")
     ap.add_argument("--halflife", type=float, default=1e6,
                     help="ARD prior EMA halflife, in latent frames")
     ap.add_argument("--max-seconds", type=float, default=2.0,
@@ -295,11 +337,9 @@ def main():
                         persistent_workers=args.workers > 0)
 
     runner = Runner.new_sym_model([
-        BlockParams(3, depth=2, stride=1),
-        BlockParams(5, depth=2, kernel=(4, 7)),
-        BlockParams(8, depth=2, kernel=(3, 9)),
-        BlockParams(13, depth=2, kernel=(2, 11)),
-    ], latent_dim=args.latent,
+        BlockParams(512, depth=6, stride=512),
+    ],
+        latent_dim=args.latent,
         stft_hop=args.hop,
         stft_win_chunks=args.win_chunks, device=device)
     if args.init:
@@ -311,15 +351,26 @@ def main():
     n_params = sum(p.numel() for m in (runner.enc, runner.dec) for p in m.parameters())
     lat = runner.enc.latency + runner.dec.latency
 
-    trainer = Trainer(runner, halflife=args.halflife,
-                      compile_model=args.compile, save=args.save)
+    trainer = Trainer( runner, [
+        BlockParams(4, stride=1),
+        BlockParams(6, depth=2),
+        BlockParams(8, depth=2),
+        BlockParams(13, depth=2),
+        BlockParams(16, depth=2),
+        BlockParams(26, depth=2),
+        BlockParams(32, depth=2),
+    ],
+        halflife=args.halflife,
+        compile_model=args.compile, save=args.save)
     print(f"{len(vctk)} utterances @ {sr} Hz ({len(batches)} batches/epoch) | "
           f"{n_params/1e6:.2f}M params | latency {lat * args.hop / sr:.3f}s | {device}\n"
           f"controls: Enter = viz now, s + Enter = save checkpoint")
+    d_params = sum(p.numel() for p in trainer.disc.parameters())
+    print(f"discriminator: {d_params/1e6:.2f}M params (train-only, not checkpointed)")
     trainer.run(args.generations, loader, lr=args.lr,
-                k_phase=args.k_phase, k_vae=args.k_vae,
-                vae_warmup=args.warmup, viz_every=args.viz_every,
-                batches_per_epoch=len(batches))
+        k_phase=args.k_phase, k_vae=args.k_vae, k_disc=args.k_disc,
+        vae_warmup=args.warmup, disc_warmup=args.disc_warmup,
+        viz_every=args.viz_every, batches_per_epoch=len(batches))
 
 
 if __name__ == "__main__":
