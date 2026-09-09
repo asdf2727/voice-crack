@@ -1,0 +1,26 @@
+[project]
+name = "voice-crack"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Cezar Titianu", email = "titicezar@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.3",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.14.0",
+    "soxr>=1.1.0",
+    "torch>=2.14.0",
+    "torchaudio>=2.11.0",
+    "torchcodec==0.16.0",
+]
+
+[project.scripts]
+voice-crack = "voice_crack:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
