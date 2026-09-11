@@ -1,9 +1,12 @@
+import os
+import random
+import select
+import sys
+
 from datasets.vctk import VCTK_092, batch_wavs
 from models import VoiceCrack
 from modules.stft import *
 from loss import *
-
-import os
 
 VERSION = "v0"
 if not os.path.exists(f"../../models/{VERSION}"):
@@ -19,6 +22,7 @@ class Trainer:
         self.model = VoiceCrack(hop, win_chunks).to(device)
         self.opt = torch.optim.Adam(self.model.parameters(), lr=lr, fused=True)
         self.vae_w = torch.tensor(vae_w)
+        self.dataset = VCTK_092("../../datasets")
 
     @torch.compile(fullgraph=True, dynamic=False)
     def _run_batch(self, x: Tensor):
@@ -51,21 +55,49 @@ class Trainer:
             since_last_step = 0
             print(f"{self.model.step_cnt} - {mag.item():.4f} - {phs.item():.4f} - {vae.item():.4f}")
             self.model.step_cnt += 1
-            if self.model.step_cnt % 1000 != 0:
+            if not self._save_requested():
                 continue
 
-            self.model.save_model(f"../../models/{VERSION}/step_{self.model.step_cnt}.pt")
+            self._save(f"step_{self.model.step_cnt}")
+
+    @staticmethod
+    def _save_requested() -> bool:
+        """Non-blocking stdin: Enter -> viz now, 's' + Enter -> checkpoint."""
+        while select.select([sys.stdin], [], [], 0)[0]:
+            line = sys.stdin.readline()
+            if line == "":  # EOF: stdin is not interactive, stop polling
+                raise OSError("stdin is not interactive")
+            if line.strip().lower() == "s":
+                return True
+        return False
 
     def run_training(self,
                      epochs: int):
-        dataset = VCTK_092("../../datasets")
-        loader = torch.utils.data.DataLoader(dataset, 4, True, collate_fn=batch_wavs, num_workers=4)
+        loader = torch.utils.data.DataLoader(self.dataset, 4, True, collate_fn=batch_wavs, num_workers=4)
         for epoch in range(epochs):
             self._run_epoch(loader)
-            self.model.save_model(f"../../models/{VERSION}/epoch_{epoch+1}.pt")
+            self._save(f"epoch_{epoch+1}")
+
+    def _save(self, name: str):
+        path = f"../../models/{VERSION}/{name}.pt"
+        self.model.save_model(path)
+        sym = f"../../models/{VERSION}/latest.pt"
+        if os.path.exists(sym): os.remove(sym)
+        os.symlink(path, f"../../models/{VERSION}/latest.pt")
+
+        wav = random.choice(self.dataset)[0].to(self.device)
+        spec = self.model.enc(wav)
+        show_hsv(self.model.enc.feats_to_hsv(spec[self.model.latency:, ...].cpu()))
+        out_spec = self.model(spec).detach()
+        show_hsv(self.model.dec.feats_to_hsv(out_spec.cpu()))
+
 
 def main():
     trainer = Trainer(256, 4, torch.device("cuda"))
+    if os.path.exists(f"../../models/{VERSION}/latest.pt"):
+        trainer.model.load_checkpoint(f"../../models/{VERSION}/latest.pt")
+    else:
+        print("No checkpoint found. Training from scratch.")
     trainer.run_training(10)
 
 if __name__ == "__main__":

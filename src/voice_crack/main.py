@@ -1,14 +1,14 @@
 import torch
 from torch import Tensor
+from time import sleep
+import random
 
 from audio.file_stream import FileSource
 from audio.device_stream import DeviceSink
-from time import sleep
 
+from datasets.vctk import VCTK_092
 from models import VoiceCrack
 from modules import stft
-
-dataset_root = "../../datasets/VCTK-Corpus-0.92/wav48_silence_trimmed/"
 
 def check_strides(x: Tensor):
     print(f"shape {tuple(x.shape)} - stride - {x.stride()} - cont? {x.is_contiguous()}")
@@ -16,8 +16,8 @@ def check_strides(x: Tensor):
 def main():
     chunk_len = 128
 
-    source = FileSource(dataset_root + "p225/p225_003_mic1.flac", 0.05)
-    wav = torch.from_numpy(source.get_wav())
+    dataset = VCTK_092("../../datasets/")
+    wav = random.choice(dataset)[0]
     check_strides(wav)
 
     encode = stft.STFT(256, 4)
@@ -34,7 +34,7 @@ def main():
 
     out_wav = decode(out_spec).numpy()
     print(f"out wav shape {out_wav.shape}")
-    with DeviceSink(chunk_len, sr=source.sample_rate()) as sink:
+    with DeviceSink(chunk_len, sr=48000) as sink:
         for i in range(len(out_wav) // chunk_len):
             start = i * chunk_len
             sink.put_chunk(out_wav[start:start+chunk_len])
