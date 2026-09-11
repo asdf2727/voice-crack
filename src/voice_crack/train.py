@@ -21,11 +21,16 @@ class Trainer:
         self.vae_w = torch.tensor(vae_w)
 
     @torch.compile(fullgraph=True, dynamic=False)
-    def _run_batch(self, x: Tensor) -> tuple[Tensor, ...]:
+    def _run_batch(self, x: Tensor):
         spec = self.model.enc(x)
         mean, log_var = self.model.spec_to_latent(spec)
         recon = self.model.latent_to_spec(mean, log_var)
-        return spec, recon, mean, log_var
+
+        self.model.vae_prior.update(mean, log_var)
+
+        mag, phs = mag_phs_loss(spec[..., self.model.latency:, :, :], recon)
+        vae = self.model.vae_prior.kld_loss(mean, log_var)
+        return mag, phs, vae
 
     def _run_epoch(self,
                    loader: torch.utils.data.DataLoader,
@@ -35,21 +40,16 @@ class Trainer:
         for batch in loader:
             since_last_step += batch.shape[0]
             batch = batch.to(self.device)
-            spec, recon, mean, log_var = self._run_batch(batch)
-
-            mag, phs = mag_phs_loss(spec[..., self.model.latency:, :, :], recon)
-            vae = self.model.vae_prior.kld_loss(mean, log_var)
+            mag, phs, vae = self._run_batch(batch)
             loss = mag + phs + vae * self.vae_w
             loss.backward()
-
-            self.model.vae_prior.update(mean, log_var)
             if since_last_step < step_size:
                 continue
 
             self.opt.step()
             self.opt.zero_grad()
             since_last_step = 0
-            print(f"{self.model.step_cnt} - mag {mag.item():.4f} - phs {phs.item():.4f} - vae {vae.item():.4f}")
+            print(f"{self.model.step_cnt} - {mag.item():.4f} - {phs.item():.4f} - {vae.item():.4f}")
             self.model.step_cnt += 1
             if self.model.step_cnt % 1000 != 0:
                 continue
@@ -59,7 +59,7 @@ class Trainer:
     def run_training(self,
                      epochs: int):
         dataset = VCTK_092("../../datasets")
-        loader = torch.utils.data.DataLoader(dataset, 4, True, collate_fn=batch_wavs)
+        loader = torch.utils.data.DataLoader(dataset, 4, True, collate_fn=batch_wavs, num_workers=4)
         for epoch in range(epochs):
             self._run_epoch(loader)
             self.model.save_model(f"../../models/{VERSION}/epoch_{epoch+1}.pt")
