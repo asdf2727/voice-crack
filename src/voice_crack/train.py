@@ -55,21 +55,26 @@ class Trainer:
             since_last_step = 0
             print(f"{self.model.step_cnt} - {mag.item():.4f} - {phs.item():.4f} - {vae.item():.4f}")
             self.model.step_cnt += 1
-            if not self._save_requested():
-                continue
+            self.check_input()
 
-            self._save(f"step_{self.model.step_cnt}")
-
-    @staticmethod
-    def _save_requested() -> bool:
+    def check_input(self) -> bool:
         """Non-blocking stdin: Enter -> viz now, 's' + Enter -> checkpoint."""
         while select.select([sys.stdin], [], [], 0)[0]:
             line = sys.stdin.readline()
             if line == "":  # EOF: stdin is not interactive, stop polling
                 raise OSError("stdin is not interactive")
             if line.strip().lower() == "s":
-                return True
+                self._save(f"step_{self.model.step_cnt}")
+            if line.strip().lower() == "show":
+                self.show_spec()
         return False
+
+    def show_spec(self):
+        wav = random.choice(self.dataset)[0].to(self.device)
+        spec = self.model.enc(wav)
+        show_hsv(self.model.enc.feats_to_hsv(spec[self.model.latency:, ...].cpu()))
+        out_spec = self.model(spec).detach()
+        show_hsv(self.model.dec.feats_to_hsv(out_spec.cpu()))
 
     def run_training(self,
                      epochs: int):
@@ -84,12 +89,6 @@ class Trainer:
         sym = f"../../models/{VERSION}/latest.pt"
         if os.path.exists(sym): os.remove(sym)
         os.symlink(path, f"../../models/{VERSION}/latest.pt")
-
-        wav = random.choice(self.dataset)[0].to(self.device)
-        spec = self.model.enc(wav)
-        show_hsv(self.model.enc.feats_to_hsv(spec[self.model.latency:, ...].cpu()))
-        out_spec = self.model(spec).detach()
-        show_hsv(self.model.dec.feats_to_hsv(out_spec.cpu()))
 
 
 def main():
