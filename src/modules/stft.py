@@ -3,8 +3,17 @@ from torch import nn, Tensor
 from typing import Callable
 import numpy as np
 
-def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
+def _wrap_angle(angle: Tensor) -> Tensor:
     return (angle + torch.pi).remainder(2 * torch.pi) - torch.pi
+
+def mag_phs_to_hsv(log_mag: Tensor, phs: Tensor) -> np.ndarray:
+        init_phs = torch.zeros_like(phs[..., :1, :])
+        phs_diff = _wrap_angle(phs.diff(dim=-2, prepend=init_phs)).numpy()
+        log_mag = log_mag.numpy()
+        h = ((phs_diff + np.pi) / (2 * np.pi) + 0.5) % 1
+        s = np.ones_like(h)
+        v = log_mag / log_mag.max()
+        return np.stack([h, s, v], axis=-1).transpose(1, 0, 2)
 
 class STFT(nn.Module):
     def __init__(self, hop: int, win_chunks: int = 1,
@@ -15,8 +24,12 @@ class STFT(nn.Module):
         self.register_buffer("window", window(self.n_fft))
 
     @property
-    def out_bins(self) -> int:
+    def out_freq(self) -> int:
         return self.n_fft // 2 + 1
+
+    @staticmethod
+    def feats_to_hsv(f: Tensor) -> np.ndarray:
+        return mag_phs_to_hsv(f[..., 5], f[..., 6])
 
     def stft(self, x: Tensor) -> Tensor:
         return torch.stft(
@@ -47,7 +60,7 @@ class STFT(nn.Module):
             dim=-1).movedim(-2, -3)
 
     @staticmethod
-    def feats_to_log_polar(f: torch.Tensor) -> tuple[Tensor, Tensor]:
+    def feats_to_log_polar(f: Tensor) -> tuple[Tensor, Tensor]:
         return f[..., 5], f[..., 6]
 
     def forward(self, x: Tensor) -> Tensor:
@@ -65,27 +78,19 @@ class ISTFT(nn.Module):
         return self.n_fft // 2 + 1
 
     @staticmethod
-    def feats_to_log_polar(f: torch.Tensor) -> tuple[Tensor, Tensor]:
+    def feats_to_log_polar(f: Tensor) -> tuple[Tensor, Tensor]:
         return f[..., 0], torch.atan2(f[..., 1], f[..., 2])
 
     @staticmethod
-    def from_feats(f: torch.Tensor) -> torch.Tensor:
+    def from_feats(f: Tensor) -> Tensor:
         """real (B?, T, F, 3) -> complex (B?, F, T)"""
-        f = f.movedim(-3, -2)
         log_mag, phs = ISTFT.feats_to_log_polar(f)
         mag = log_mag.expm1()
-        return torch.polar(mag, phs)
+        return torch.polar(mag, phs).movedim(-2, -1)
 
     @staticmethod
-    def feats_to_hsv(f: torch.Tensor) -> np.ndarray:
-        log_mag = f.select(-2, 0).numpy()
-        phs = torch.atan2(f.select(-2, 1), f.select(-2, 2))
-        init_phs = torch.zeros_like(phs[..., :1])
-        phs_diff = _wrap_angle(phs.diff(prepend=init_phs)).numpy()
-        h = ((phs_diff + np.pi) / (2 * np.pi) + 0.5) % 1
-        s = np.ones_like(h)
-        v = log_mag / log_mag.max().item()
-        return np.stack([h, s, v], axis=-1)
+    def feats_to_hsv(f: Tensor) -> np.ndarray:
+        return mag_phs_to_hsv(*ISTFT.feats_to_log_polar(f))
 
     def istft(self, x: Tensor, length: int | None = None) -> Tensor:
         return torch.istft(

@@ -17,7 +17,7 @@ class LatentPrior(nn.Module):
     def kld_rel_loss(self, mean: Tensor, log_var: Tensor) -> Tensor:
         """kld_loss minus the terms constant w.r.t. the encoder (same gradients)."""
         ...
-    def update(self, mean: Tensor, log_var: Tensor):
+    def update(self, mean: Tensor, log_var: Tensor, halflife: float = 1e6):
         """Adapt the prior and relevance statistics to the encoded data."""
         ...
     @property
@@ -56,7 +56,7 @@ class UnitPrior(LatentPrior):
         return kld.sum(dim=-1).mean() * 0.5
 
     @torch.no_grad()
-    def update(self, mean: Tensor, log_var: Tensor, halflife = 1e6):
+    def update(self, mean: Tensor, log_var: Tensor, halflife: float = 1e6):
         keep = 0.5 ** (mean[..., 0].numel() / halflife)
         sq = mean.square().flatten(0, -2).mean(dim=0)
         self.mean_sq = keep * self.mean_sq + (1 - keep) * sq
@@ -100,7 +100,7 @@ class ScaledPrior(LatentPrior):
         return kld.sum(dim=-1).mean() * 0.5
 
     @torch.no_grad()
-    def update(self, mean: Tensor, log_var: Tensor, halflife = 1e6):
+    def update(self, mean: Tensor, log_var: Tensor, halflife: float = 1e6):
         keep = 0.5 ** (mean[..., 0].numel() / halflife)
         sq = mean.square().flatten(0, -2).mean(dim=0)
         var = log_var.exp().flatten(0, -2).mean(dim=0)

@@ -6,20 +6,25 @@ from modules import *
 
 class VoiceCrack(nn.Module):
     def __init__(self,
-                 fft_bins,
+                 hop: int,
+                 win_chunks: int,
                  enc_layers: int = 8,
                  enc_feats: int = 3,
                  dec_layers: int = 8,
                  dec_feats: int = 3):
         super().__init__()
-        self.fft_bins = fft_bins
+        self.hop = hop
+        self.win_chunks = win_chunks
         self.enc_layers = enc_layers
         self.enc_feats = enc_feats
         self.dec_layers = dec_layers
         self.dec_feats = dec_feats
         self.step_cnt = 0
-        in_feats = self.enc_feats * self.fft_bins
-        out_feats = self.dec_feats * self.fft_bins
+
+        self.enc = STFT(hop, win_chunks)
+        self.dec = ISTFT(self.enc)
+        in_feats = self.enc_feats * self.enc.out_freq
+        out_feats = self.dec_feats * self.dec.in_freq
         self.in_filter = nn.Linear(8, self.enc_feats)
         self.enc_blocks = Vocos(in_feats, self.enc_layers)
         self.bottleneck = VAE(in_feats, out_feats)
@@ -29,7 +34,8 @@ class VoiceCrack(nn.Module):
 
     def _config_dict(self):
         return {
-            "fft_bins": self.fft_bins,
+            "hop": self.hop,
+            "win_chunks": self.win_chunks,
             "enc_layers": self.enc_layers,
             "enc_feats": self.enc_feats,
             "dec_layers": self.dec_layers,
@@ -71,10 +77,9 @@ class VoiceCrack(nn.Module):
         split = torch.unflatten(decoded, -1, (-1, self.dec_feats))  # unflatten into frequency bins with features
         return split
 
-    def spec_to_latent(self, spec: Tensor, halflife: float | None = 1e6) -> tuple[Tensor, Tensor]:
+    def spec_to_latent(self, spec: Tensor) -> tuple[Tensor, Tensor]:
         encoded = self._encode_spec(spec)
         mean, log_var = self.bottleneck.split(encoded)
-        if halflife: self.vae_prior.update(mean, log_var, halflife)
         return mean, log_var
 
     def latent_to_spec(self, mean: Tensor, log_var: Tensor) -> Tensor:

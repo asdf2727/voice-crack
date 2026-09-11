@@ -16,6 +16,8 @@ changed a few things
 URL = "https://datashare.is.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip"
 CHECKSUM = "f96258be9fdc2cbff6559541aae7ea4f59df3fcaf5cf963aae5ca647357e359c"
 
+SampleType = tuple[Tensor, int, str, str, str]
+
 class VCTK_092(Dataset):
     """*VCTK 0.92* :cite:`yamagishi2019vctk` dataset
 
@@ -63,7 +65,7 @@ class VCTK_092(Dataset):
             name, ext = os.path.splitext(file.name)
             self._samples.append((*name.split("_"), ext))
 
-    def __getitem__(self, n: int) -> Tensor:
+    def __getitem__(self, n: int) -> tuple[Tensor, int, str | None, str, str]:
         """Load the n-th sample from the dataset.
 
         Args:
@@ -79,18 +81,40 @@ class VCTK_092(Dataset):
                 Transcript
             str:
                 Speaker ID
-            std:
+            str:
                 Utterance ID
         """
         speaker_id, utterance_id, mic_id, audio_ext = self._samples[n]
-        transcript_path = os.path.join(self._txt_dir, speaker_id, f"{speaker_id}_{utterance_id}.txt")
-        audio_path =    os.path.join(self._audio_dir, speaker_id, f"{speaker_id}_{utterance_id}_{mic_id}{audio_ext}")
+        transcript_path = self._txt_dir / speaker_id / f"{speaker_id}_{utterance_id}.txt"
+        audio_path = self._audio_dir / speaker_id / f"{speaker_id}_{utterance_id}_{mic_id}{audio_ext}"
 
-        with open(transcript_path) as file_path:
-            transcript = file_path.readlines()[0]
+        transcript = None
+        if os.path.isfile(transcript_path):
+            with open(transcript_path) as file_path:
+                transcript = file_path.readlines()[0]
         waveform, sample_rate =  torchaudio.load(audio_path)
+        waveform = waveform.mean(0) # average all channels
 
-        return waveform
+        return waveform, sample_rate, transcript, speaker_id, utterance_id
 
     def __len__(self) -> int:
         return len(self._samples)
+
+import torch
+import torch.nn.functional as F
+from random import randrange
+
+CROP = 3 * 48000
+
+def batch_wavs(inputs: list[SampleType]) -> Tensor:
+    wav_list = [inpt[0] for inpt in inputs]
+    crops = []
+    for wav in wav_list:
+        if wav.numel() == CROP:
+            crops.append(wav)
+        elif wav.numel() < CROP:
+            crops.append(F.pad(wav, (0, CROP - wav.numel())))
+        else:
+            offset = randrange(wav.numel() - CROP)
+            crops.append(wav[offset:offset + CROP])
+    return torch.stack(crops)

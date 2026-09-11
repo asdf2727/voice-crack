@@ -1,13 +1,16 @@
 import torch
+from torch import Tensor
 
 from audio.file_stream import FileSource
 from audio.device_stream import DeviceSink
 from time import sleep
+
+from models import VoiceCrack
 from modules import stft
 
-dataset_root = "../datasets/VCTK-Corpus-0.92/wav48_silence_trimmed/"
+dataset_root = "../../datasets/VCTK-Corpus-0.92/wav48_silence_trimmed/"
 
-def check_strides(x: torch.Tensor):
+def check_strides(x: Tensor):
     print(f"shape {tuple(x.shape)} - stride - {x.stride()} - cont? {x.is_contiguous()}")
 
 def main():
@@ -19,13 +22,15 @@ def main():
 
     encode = stft.STFT(256, 4)
     decode = stft.ISTFT(encode)
+    model = VoiceCrack.load_model("../../models/v0/step_4000.pt").eval()
 
     spec = encode(wav)
     check_strides(spec)
-    out_spec = torch.stack([spec[..., 5], spec[..., 3], spec[..., 2]], dim=-1)
-    check_strides(out_spec)
+    stft.show_hsv(encode.feats_to_hsv(spec[model.latency:, ...]))
 
-    stft.show_hsv(decode.feats_to_hsv(out_spec.movedim(-1, -2)))
+    out_spec = model(spec).detach()
+    check_strides(out_spec)
+    stft.show_hsv(decode.feats_to_hsv(out_spec))
 
     out_wav = decode(out_spec).numpy()
     print(f"out wav shape {out_wav.shape}")
