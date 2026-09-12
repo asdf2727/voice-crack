@@ -8,7 +8,7 @@ from models import VoiceCrack
 from modules.stft import *
 from loss import *
 
-VERSION = "v0"
+VERSION = "v0.1"
 if not os.path.exists(f"../../models/{VERSION}"):
     os.mkdir(f"../../models/{VERSION}")
 
@@ -53,7 +53,7 @@ class Trainer:
             self.opt.step()
             self.opt.zero_grad()
             since_last_step = 0
-            print(f"{self.model.step_cnt} - {mag.item():.4f} - {phs.item():.4f} - {vae.item():.4f}")
+            print(f"{self.model.step_cnt}: {mag.item():.4f} + {phs.item():.4f} + {vae.item():.4f} = {loss.item():.4f}")
             self.model.step_cnt += 1
             self.check_input()
 

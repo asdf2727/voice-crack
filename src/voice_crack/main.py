@@ -22,7 +22,10 @@ def main():
 
     encode = stft.STFT(256, 4)
     decode = stft.ISTFT(encode)
-    model = VoiceCrack.load_model("../../models/v0/step_4000.pt").eval()
+    model = VoiceCrack.load_model("../../models/v0/epoch_1.pt").eval()
+    print(model.vae_prior.snr.sum())
+    print(str(model.in_filter.weight.detach().numpy()))
+    print(str(model.in_filter.bias.detach().numpy()))
 
     spec = encode(wav)
     check_strides(spec)

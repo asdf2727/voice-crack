@@ -45,6 +45,7 @@ class UnitPrior(LatentPrior):
         super().__init__()
         self._latent_dim = latent_dim
         self.register_buffer("mean_sq", torch.zeros(latent_dim))  # EMA of E[mu^2]
+        self.register_buffer("mean_var", torch.zeros(latent_dim))  # EMA of E[sigma^2]
 
     def kld_loss(self, mean: Tensor, log_var: Tensor):
         """KL( N(mean, exp(log_var)) || N(0, I) )"""
@@ -59,11 +60,13 @@ class UnitPrior(LatentPrior):
     def update(self, mean: Tensor, log_var: Tensor, halflife: float = 1e6):
         keep = 0.5 ** (mean[..., 0].numel() / halflife)
         sq = mean.square().flatten(0, -2).mean(dim=0)
-        self.mean_sq = keep * self.mean_sq + (1 - keep) * sq
+        var = log_var.exp().flatten(0, -2).mean(dim=0)
+        self.mean_sq =  keep * self.mean_sq +  (1 - keep) * sq
+        self.mean_var = keep * self.mean_var + (1 - keep) * var
 
     @property
     def snr(self) -> Tensor:
-        return self.mean_sq
+        return self.mean_sq / self.mean_var
 
 
 class ScaledPrior(LatentPrior):
