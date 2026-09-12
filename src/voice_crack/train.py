@@ -2,6 +2,7 @@ import os
 import random
 import select
 import sys
+import csv
 
 from datasets.vctk import VCTK_092, batch_wavs
 from models import VoiceCrack
@@ -23,6 +24,9 @@ class Trainer:
         self.opt = torch.optim.Adam(self.model.parameters(), lr=lr, fused=True)
         self.vae_w = torch.tensor(vae_w)
         self.dataset = VCTK_092("../../datasets")
+        self.csv_buffer: list[list[str]] = []
+        if not os.path.exists(f"../../models/{VERSION}/hist.csv"):
+            self.csv_buffer.append(["step", "mag", "phs", "vae", "tot"])
 
     @torch.compile(fullgraph=True, dynamic=False)
     def _run_batch(self, x: Tensor):
@@ -53,7 +57,14 @@ class Trainer:
             self.opt.step()
             self.opt.zero_grad()
             since_last_step = 0
-            print(f"{self.model.step_cnt}: {mag.item():.4f} + {phs.item():.4f} + {vae.item():.4f} = {loss.item():.4f}")
+            step_data = [
+                f"{self.model.step_cnt}",
+                f"{mag.item():.4f}",
+                f"{phs.item():.4f}",
+                f"{vae.item():.4f}",
+                f"{loss.item():.4f}"]
+            self.csv_buffer.append(step_data)
+            print(" - ".join(step_data))
             self.model.step_cnt += 1
             self.check_input()
 
@@ -89,6 +100,12 @@ class Trainer:
         sym = f"../../models/{VERSION}/latest.pt"
         if os.path.exists(sym): os.remove(sym)
         os.symlink(path, f"../../models/{VERSION}/latest.pt")
+        hist = f"../../models/{VERSION}/hist.csv"
+        with open(hist, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            for row in self.csv_buffer:
+                writer.writerow(row)
+            self.csv_buffer = []
 
 
 def main():
