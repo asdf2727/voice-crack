@@ -29,7 +29,7 @@ class ConvNeXt2D(nn.Module):
         if isinstance(kernel, int):
             kernel = (kernel, kernel)
         if hidden is None:
-            hidden = 4 * channels
+            hidden = 3 * channels
         super().__init__()
         self.dw_conv = nn.Conv2d(channels, channels, kernel, padding=(kernel[0] // 2, 0), groups=channels)
         self.ffwd = FeedForward(channels, hidden, scale)

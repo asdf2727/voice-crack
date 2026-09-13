@@ -4,26 +4,45 @@ import select
 import sys
 import csv
 
-from datasets.vctk import VCTK_092, batch_wavs
+import torch
+import torch.nn.functional as F
+from random import randrange
+
+from datasets.vctk import VCTK_092, SampleType
 from models import VoiceCrack
 from modules.stft import *
 from loss import *
 
-VERSION = "v0.1"
+VERSION = "v0.2"
 if not os.path.exists(f"../../models/{VERSION}"):
     os.mkdir(f"../../models/{VERSION}")
 
+CROP = 3 * 48000
+
+def batch_wavs(inputs: list[SampleType]) -> Tensor:
+    wav_list = [inpt[0] for inpt in inputs]
+    crops = []
+    for wav in wav_list:
+        if wav.numel() == CROP:
+            crops.append(wav)
+        elif wav.numel() < CROP:
+            crops.append(F.pad(wav, (0, CROP - wav.numel())))
+        else:
+            offset = randrange(wav.numel() - CROP)
+            crops.append(wav[offset:offset + CROP])
+    return torch.stack(crops)
+
 class Trainer:
     def __init__(self,
-                 hop: int, win_chunks: int,
+                 model: VoiceCrack,
                  device: torch.device = torch.device("cpu"),
                  lr: float = 1e-4,
                  vae_w: float = 1.0):
         self.device = device
-        self.model = VoiceCrack(hop, win_chunks).to(device)
+        self.model = model.to(device)
         self.opt = torch.optim.Adam(self.model.parameters(), lr=lr, fused=True)
         self.vae_w = torch.tensor(vae_w)
-        self.dataset = VCTK_092("../../datasets")
+        self.dataset = VCTK_092("../../datasets", download=True)
         self.csv_buffer: list[list[str]] = []
         if not os.path.exists(f"../../models/{VERSION}/hist.csv"):
             self.csv_buffer.append(["step", "mag", "phs", "vae", "tot"])
@@ -42,7 +61,7 @@ class Trainer:
 
     def _run_epoch(self,
                    loader: torch.utils.data.DataLoader,
-                   step_size: int = 4):
+                   step_size: int):
         since_last_step = 0
         self.opt.zero_grad()
         for batch in loader:
@@ -89,9 +108,9 @@ class Trainer:
 
     def run_training(self,
                      epochs: int):
-        loader = torch.utils.data.DataLoader(self.dataset, 4, True, collate_fn=batch_wavs, num_workers=4)
+        loader = torch.utils.data.DataLoader(self.dataset, 16, True, collate_fn=batch_wavs, num_workers=4)
         for epoch in range(epochs):
-            self._run_epoch(loader)
+            self._run_epoch(loader, step_size=16)
             self._save(f"epoch_{epoch+1}")
 
     def _save(self, name: str):
@@ -109,7 +128,8 @@ class Trainer:
 
 
 def main():
-    trainer = Trainer(256, 4, torch.device("cuda"))
+    model = VoiceCrack(1024, 4, 512)
+    trainer = Trainer(model, torch.device("cuda"))
     if os.path.exists(f"../../models/{VERSION}/latest.pt"):
         trainer.model.load_checkpoint(f"../../models/{VERSION}/latest.pt")
     else:

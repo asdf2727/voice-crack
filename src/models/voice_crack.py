@@ -6,40 +6,38 @@ from modules import *
 
 class VoiceCrack(nn.Module):
     def __init__(self,
-                 hop: int,
+                 n_fft: int,
                  win_chunks: int,
-                 enc_layers: int = 8,
-                 enc_feats: int = 3,
-                 dec_layers: int = 8,
-                 dec_feats: int = 3):
+                 vocos_dim: int,
+                 freq_bin_feats: int = 3,
+                 conv_layers: int = 12):
         super().__init__()
-        self.hop = hop
+        self.n_fft = n_fft
         self.win_chunks = win_chunks
-        self.enc_layers = enc_layers
-        self.enc_feats = enc_feats
-        self.dec_layers = dec_layers
-        self.dec_feats = dec_feats
+        self.vocos_dim = vocos_dim
+        self.freq_bin_feats = freq_bin_feats
+        self.conv_layers = conv_layers
         self.step_cnt = 0
 
-        self.enc = STFT(hop, win_chunks)
+        self.enc = STFT(n_fft, win_chunks)
         self.dec = ISTFT(self.enc)
-        in_feats = self.enc_feats * self.enc.out_freq
-        out_feats = self.dec_feats * self.dec.in_freq
-        self.in_filter = nn.Linear(8, self.enc_feats)
-        self.enc_blocks = Vocos(in_feats, self.enc_layers)
-        self.bottleneck = VAE(in_feats, out_feats)
-        self.dec_blocks = Vocos(out_feats, self.dec_layers)
-        self.out_filter = nn.Linear(self.dec_feats, 3)
+        in_feats = self.freq_bin_feats * self.enc.out_freq
+        out_feats = 3 * self.dec.in_freq
+        self.freq_bin_filter = nn.Linear(8, self.freq_bin_feats)
+        self.enc_map = nn.Linear(in_feats, self.vocos_dim)
+        self.enc_vocos = Vocos(self.vocos_dim, self.conv_layers)
+        self.bottleneck = VAE(self.vocos_dim, self.vocos_dim)
+        self.dec_vocos = Vocos(self.vocos_dim, self.conv_layers)
+        self.dec_map = nn.Linear(self.vocos_dim, out_feats)
         self.vae_prior = vae_loss.UnitPrior(self.bottleneck.latent_dim)
 
     def _config_dict(self):
         return {
-            "hop": self.hop,
+            "n_fft": self.n_fft,
             "win_chunks": self.win_chunks,
-            "enc_layers": self.enc_layers,
-            "enc_feats": self.enc_feats,
-            "dec_layers": self.dec_layers,
-            "dec_feats": self.dec_feats,
+            "vocos_dim": self.vocos_dim,
+            "freq_bin_feats": self.freq_bin_feats,
+            "conv_layers": self.conv_layers,
         }
 
     def save_model(self, path):
@@ -65,16 +63,16 @@ class VoiceCrack(nn.Module):
 
     @property
     def latency(self):
-        return self.enc_blocks.latency + self.dec_blocks.latency
+        return self.enc_vocos.latency + self.dec_vocos.latency
 
     def _encode_spec(self, spec: Tensor) -> Tensor:
-        filtered = self.in_filter(spec)  # select features
+        filtered = self.freq_bin_filter(spec)  # select features
         flattened = torch.flatten(filtered, -2, -1)  # flatten frequency and feature dimensions
-        return self.dec_blocks(flattened)  # run encoder vocos
+        return self.enc_vocos(self.enc_map(flattened))  # run encoder vocos
 
     def _decode_spec(self, latent: Tensor) -> Tensor:
-        decoded = self.dec_blocks(latent)  # run decoder vocos
-        split = torch.unflatten(decoded, -1, (-1, self.dec_feats))  # unflatten into frequency bins with features
+        decoded = self.dec_map(self.dec_vocos(latent))  # run decoder vocos
+        split = torch.unflatten(decoded, -1, (-1, 3))  # unflatten into frequency bins with features
         return split
 
     def spec_to_latent(self, spec: Tensor) -> tuple[Tensor, Tensor]:

@@ -1,3 +1,4 @@
+import os.path
 import torch
 from torch import Tensor
 from time import sleep
@@ -14,29 +15,30 @@ def check_strides(x: Tensor):
     print(f"shape {tuple(x.shape)} - stride - {x.stride()} - cont? {x.is_contiguous()}")
 
 def main():
-    chunk_len = 128
-
     dataset = VCTK_092("../../datasets/")
-    wav = random.choice(dataset)[0]
-    check_strides(wav)
+    id = random.randrange(len(dataset))
+    print(id)
+    wav = dataset[id][0]
 
-    encode = stft.STFT(256, 4)
+    encode = stft.STFT(1024, 4)
     decode = stft.ISTFT(encode)
-    model = VoiceCrack.load_model("../../models/v0/epoch_1.pt").eval()
-    print(model.vae_prior.snr.sum())
-    print(str(model.in_filter.weight.detach().numpy()))
-    print(str(model.in_filter.bias.detach().numpy()))
 
     spec = encode(wav)
-    check_strides(spec)
-    stft.show_hsv(encode.feats_to_hsv(spec[model.latency:, ...]))
+    stft.show_hsv(encode.feats_to_hsv(spec))
 
-    out_spec = model(spec).detach()
-    check_strides(out_spec)
-    stft.show_hsv(decode.feats_to_hsv(out_spec))
+    run_model = True and os.path.exists("../../models/v0.2/latest.pt")
+    if run_model:
+        model = VoiceCrack.load_model("../../models/v0.2/latest.pt").eval()
+        print(model.vae_prior.snr.sum())
+        print(str(model.in_filter.weight.detach().numpy()))
+        print(str(model.in_filter.bias.detach().numpy()))
+        out_spec = model(spec).detach()
+        stft.show_hsv(decode.feats_to_hsv(out_spec))
+    else:
+        out_spec = stft.to_out_feats(spec)
 
     out_wav = decode(out_spec).numpy()
-    print(f"out wav shape {out_wav.shape}")
+    chunk_len = 128
     with DeviceSink(chunk_len, sr=48000) as sink:
         for i in range(len(out_wav) // chunk_len):
             start = i * chunk_len

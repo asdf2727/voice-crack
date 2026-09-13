@@ -15,12 +15,17 @@ def mag_phs_to_hsv(log_mag: Tensor, phs: Tensor) -> np.ndarray:
         v = log_mag / log_mag.max()
         return np.stack([h, s, v], axis=-1).transpose(1, 0, 2)
 
+
+def to_out_feats(f: Tensor):
+    return torch.stack((f[..., 5], f[..., 0], f[..., 1]), dim=-1)
+
+
 class STFT(nn.Module):
-    def __init__(self, hop: int, win_chunks: int = 1,
+    def __init__(self, n_fft: int, win_chunks: int = 1,
                  window: Callable[[int], Tensor] = torch.hamming_window):
         super().__init__()
-        self.hop = hop
-        self.n_fft = win_chunks * hop
+        self.hop = n_fft // win_chunks
+        self.n_fft = n_fft
         self.register_buffer("window", window(self.n_fft))
 
     @property
@@ -79,7 +84,7 @@ class ISTFT(nn.Module):
 
     @staticmethod
     def feats_to_log_polar(f: Tensor) -> tuple[Tensor, Tensor]:
-        return f[..., 0], torch.atan2(f[..., 1], f[..., 2])
+        return f[..., 0], torch.atan2(f[..., 2], f[..., 1])
 
     @staticmethod
     def from_feats(f: Tensor) -> Tensor:

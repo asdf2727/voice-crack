@@ -99,22 +99,3 @@ class VCTK_092(Dataset):
 
     def __len__(self) -> int:
         return len(self._samples)
-
-import torch
-import torch.nn.functional as F
-from random import randrange
-
-CROP = 3 * 48000
-
-def batch_wavs(inputs: list[SampleType]) -> Tensor:
-    wav_list = [inpt[0] for inpt in inputs]
-    crops = []
-    for wav in wav_list:
-        if wav.numel() == CROP:
-            crops.append(wav)
-        elif wav.numel() < CROP:
-            crops.append(F.pad(wav, (0, CROP - wav.numel())))
-        else:
-            offset = randrange(wav.numel() - CROP)
-            crops.append(wav[offset:offset + CROP])
-    return torch.stack(crops)
