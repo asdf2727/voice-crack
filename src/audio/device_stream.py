@@ -6,14 +6,16 @@ import queue
 from time import sleep
 
 class DeviceSource(StreamSource):
-    def __init__(self, chunk_time: float, sr: int = 44100):
+    def __init__(self, chunk_time: float, sr: int = 44100, device: int | str = "default"):
         self._sr = sr
         self._chunk_size = int(sr * chunk_time)
         self.q = queue.Queue[np.ndarray]()
+        if device is str:
+            device = sd.query_devices(device, 'input')["index"]
         self._stream = sd.InputStream(
             samplerate=sr,
             blocksize=self._chunk_size,
-            device=6,
+            device=device,
             channels=1,
             dtype='float32',
             callback=self._callback)
@@ -35,13 +37,14 @@ class DeviceSource(StreamSource):
         return self._to_mono(self.q.get())
 
 class DeviceSink(StreamSink):
-    def __init__(self, chunk_size: int, sr: int = 44100):
+    def __init__(self, chunk_size: int, sr: int = 44100, device: int | str = "default"):
         self.q = queue.Queue[np.ndarray](maxsize=4)
-        #print(sd.query_devices())
+        if device is str:
+            device = sd.query_devices(device, 'output')["index"]
         self._stream = sd.OutputStream(
             samplerate=sr,
             blocksize=chunk_size,
-            device=6,
+            device=device,
             channels=1,
             dtype='float32',
             callback=self._callback)

@@ -25,9 +25,9 @@ class LatentPrior(nn.Module):
         """Per-axis weighed variance for relevancy detection."""
         ...
 
-    @staticmethod
-    def relevant_dims(var: Tensor, frac: float | None = 0.99) -> Tensor:
+    def relevant_dims(self, frac: float | None = 0.99) -> Tensor:
         """Indices of the axes explaining `frac` of the relevance statistic, most relevant first."""
+        var = self.snr
         order = var.argsort(descending=True)
         if frac is None: return order
         csum = var[order].cumsum(0)

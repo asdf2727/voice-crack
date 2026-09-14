@@ -29,9 +29,9 @@ def main():
     run_model = True and os.path.exists("../../models/v0.2/latest.pt")
     if run_model:
         model = VoiceCrack.load_model("../../models/v0.2/latest.pt").eval()
-        print(model.vae_prior.snr.sum())
-        print(str(model.in_filter.weight.detach().numpy()))
-        print(str(model.in_filter.bias.detach().numpy()))
+        print(model.vae_prior.snr[model.vae_prior.relevant_dims()])
+        print(str(model.freq_bin_filter.weight.detach().numpy()))
+        print(str(model.freq_bin_filter.bias.detach().numpy()))
         out_spec = model(spec).detach()
         stft.show_hsv(decode.feats_to_hsv(out_spec))
     else:
