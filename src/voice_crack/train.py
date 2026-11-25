@@ -86,6 +86,17 @@ class Trainer:
             mag, phs, vae = self._run_batch_comp(batch)
             loss = mag + phs + vae * self.vae_w
             loss.backward()
+
+            if loss.item() > 200:
+                print("Caught loss explosion bug!")
+                for wav in batch:
+                    mag, phs, vae = self._run_batch(wav)
+                    loss = mag + phs + vae * self.vae_w
+                    if loss < 200: continue
+                    print(f"{mag} - {vae} - {phs} - {loss}")
+                    self.show_spec(wav)
+                raise AssertionError
+
             if since_last_step < step_size:
                 continue
 
@@ -103,14 +114,8 @@ class Trainer:
 
             end_time = datetime.now()
             gflops = batch_flops * since_last_step / ((end_time - begin_time).microseconds * 1000)
-            print(f"{gflops:.3f} FLOPS")
+            print(f"{gflops:.3f} GFLOPS")
             begin_time = end_time
-
-            if loss.item() > 200:
-                print("Caught loss explosion bug!")
-                for wav in batch:
-                    self.show_spec(wav)
-                raise AssertionError
 
             since_last_step = 0
             self.model.step_cnt += 1
@@ -131,15 +136,17 @@ class Trainer:
 
     def show_spec(self, wav: Tensor):
         spec = self.model.enc(wav)
+        print("aaaaa", file=sys.stderr)
         show_hsv(self.model.enc.feats_to_hsv(spec.cpu()))
         out_spec = self.model(spec).detach()
+        print("bbbbb", file=sys.stderr)
         show_hsv(self.model.dec.feats_to_hsv(out_spec.cpu()))
 
     def run_training(self,
                      epochs: int):
-        loader = torch.utils.data.DataLoader(self.dataset, 32, True, collate_fn=batch_wavs, num_workers=4)
+        loader = torch.utils.data.DataLoader(self.dataset, 16, True, collate_fn=batch_wavs, num_workers=4)
         for epoch in range(epochs):
-            self._run_epoch(loader, step_size=32)
+            self._run_epoch(loader, step_size=16)
             self._save(f"step_{self.model.step_cnt}")
 
     def _save(self, name: str):
