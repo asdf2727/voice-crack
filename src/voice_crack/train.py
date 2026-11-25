@@ -4,7 +4,6 @@ import select
 import sys
 import csv
 
-import torch
 import torch.nn.functional as F
 from random import randrange
 
@@ -13,7 +12,7 @@ from models import VoiceCrack
 from modules.stft import *
 from loss import *
 
-VERSION = "v0.2"
+VERSION = "v0.3"
 if not os.path.exists(f"../../models/{VERSION}"):
     os.mkdir(f"../../models/{VERSION}")
 
@@ -47,7 +46,7 @@ class Trainer:
         if not os.path.exists(f"../../models/{VERSION}/hist.csv"):
             self.csv_buffer.append(["step", "mag", "phs", "vae", "tot"])
 
-    @torch.compile(fullgraph=True, dynamic=False)
+    #@torch.compile(fullgraph=True, dynamic=False)
     def _run_batch(self, x: Tensor):
         spec = self.model.enc(x)
         mean, log_var = self.model.spec_to_latent(spec)

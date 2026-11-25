@@ -24,11 +24,11 @@ class VoiceCrack(nn.Module):
         in_feats = self.freq_bin_feats * self.enc.out_freq
         out_feats = 3 * self.dec.in_freq
         self.freq_bin_filter = nn.Linear(8, self.freq_bin_feats)
-        self.enc_map = nn.Linear(in_feats, self.vocos_dim)
+        self.enc_map = GatedFFN(in_feats, in_feats, self.vocos_dim)
         self.enc_vocos = Vocos(self.vocos_dim, self.conv_layers)
         self.bottleneck = VAE(self.vocos_dim, self.vocos_dim)
         self.dec_vocos = Vocos(self.vocos_dim, self.conv_layers)
-        self.dec_map = nn.Linear(self.vocos_dim, out_feats)
+        self.dec_map = GatedFFN(self.vocos_dim, out_feats, out_feats)
         self.vae_prior = vae_loss.UnitPrior(self.bottleneck.latent_dim)
 
     def _config_dict(self):
