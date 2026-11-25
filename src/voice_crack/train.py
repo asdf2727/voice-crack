@@ -16,7 +16,7 @@ from models import VoiceCrack
 from modules.stft import *
 from loss import *
 
-VERSION = "v0.4"
+VERSION = "v0.3"
 if not os.path.exists(f"../../models/{VERSION}"):
     os.mkdir(f"../../models/{VERSION}")
 
