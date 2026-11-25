@@ -64,9 +64,10 @@ class Trainer:
         vae = self.model.vae_prior.kld_loss(mean, log_var)
         return mag, phs, vae
 
-    def _get_batch_flops(self, batch: Tensor) -> int:
+    def _get_batch_flops(self, loader) -> int:
+        wav = next(iter(loader))[0].to(self.device)
         with FlopCounterMode(display=False) as counter:
-            mag, phs, vae = self._run_batch(batch)
+            mag, phs, vae = self._run_batch(wav)
             loss = mag + phs + vae * self.vae_w
             loss.backward()
         self.model.zero_grad(set_to_none=True)
@@ -76,13 +77,12 @@ class Trainer:
                    loader: torch.utils.data.DataLoader,
                    step_size: int):
         since_last_step = 0
-        batch_flops = None
+        batch_flops = self._get_batch_flops(loader)
         begin_time = datetime.now()
         self.opt.zero_grad()
         for batch in loader:
             since_last_step += batch.shape[0]
             batch = batch.to(self.device)
-            if batch_flops is None: batch_flops = self._get_batch_flops(batch[0])
             mag, phs, vae = self._run_batch_comp(batch)
             loss = mag + phs + vae * self.vae_w
             loss.backward()
@@ -91,10 +91,7 @@ class Trainer:
 
             self.opt.step()
             self.opt.zero_grad()
-            end_time = datetime.now()
-            print(f"{batch_flops * since_last_step / (end_time - begin_time).microseconds} MFLOPS")
-            begin_time = end_time
-            since_last_step = 0
+
             step_data = [
                 f"{self.model.step_cnt}",
                 f"{mag.item():.4f}",
@@ -103,6 +100,19 @@ class Trainer:
                 f"{loss.item():.4f}"]
             self.csv_buffer.append(step_data)
             print(" - ".join(step_data))
+
+            end_time = datetime.now()
+            gflops = batch_flops * since_last_step / ((end_time - begin_time).microseconds * 1000)
+            print(f"{gflops:.3f} FLOPS")
+            begin_time = end_time
+
+            if loss.item() > 200:
+                print("Caught loss explosion bug!")
+                for wav in batch:
+                    self.show_spec(wav)
+                raise AssertionError
+
+            since_last_step = 0
             self.model.step_cnt += 1
             self.check_input()
 
@@ -115,21 +125,21 @@ class Trainer:
             if line.strip().lower() == "s":
                 self._save(f"step_{self.model.step_cnt}")
             if line.strip().lower() == "p":
-                self.show_spec()
+                wav = random.choice(self.dataset)[0].to(self.device)
+                self.show_spec(wav)
         return False
 
-    def show_spec(self):
-        wav = random.choice(self.dataset)[0].to(self.device)
+    def show_spec(self, wav: Tensor):
         spec = self.model.enc(wav)
-        show_hsv(self.model.enc.feats_to_hsv(spec[self.model.latency:, ...].cpu()))
+        show_hsv(self.model.enc.feats_to_hsv(spec.cpu()))
         out_spec = self.model(spec).detach()
         show_hsv(self.model.dec.feats_to_hsv(out_spec.cpu()))
 
     def run_training(self,
                      epochs: int):
-        loader = torch.utils.data.DataLoader(self.dataset, 16, True, collate_fn=batch_wavs, num_workers=4)
+        loader = torch.utils.data.DataLoader(self.dataset, 32, True, collate_fn=batch_wavs, num_workers=4)
         for epoch in range(epochs):
-            self._run_epoch(loader, step_size=16)
+            self._run_epoch(loader, step_size=32)
             self._save(f"step_{self.model.step_cnt}")
 
     def _save(self, name: str):
@@ -148,7 +158,7 @@ class Trainer:
 
 def main():
     model = VoiceCrack(1024, 4, 512)
-    trainer = Trainer(model, torch.device("cuda"))
+    trainer = Trainer(model, torch.device("cuda"), comp_batch=True)
     if os.path.exists(f"../../models/{VERSION}/latest.pt"):
         trainer.model.load_checkpoint(f"../../models/{VERSION}/latest.pt")
     else:
