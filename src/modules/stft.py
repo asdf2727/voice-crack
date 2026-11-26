@@ -34,7 +34,7 @@ class STFT(nn.Module):
 
     @staticmethod
     def feats_to_hsv(f: Tensor) -> np.ndarray:
-        return mag_phs_to_hsv(f[..., 5], f[..., 6])
+        return mag_phs_to_hsv(f[..., 2], f[..., 3])
 
     def stft(self, x: Tensor) -> Tensor:
         return torch.stft(
