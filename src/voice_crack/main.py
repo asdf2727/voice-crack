@@ -1,8 +1,9 @@
 import os.path
-from torch import Tensor
-import torch.nn.functional as F
 import random
 
+import torch
+from torch import Tensor
+import torch.nn.functional as F
 
 from audio.device_stream import DeviceSink
 from audio.file_stream import FileSource, FileSink
@@ -10,6 +11,7 @@ from audio.tensor_stream import ArraySource
 from datasets.vctk import VCTK_092
 from models import VoiceCrack
 from modules import stft
+from voice_crack.const import VERSION
 
 def check_strides(x: Tensor):
     print(f"shape {tuple(x.shape)} - stride - {x.stride()} - cont? {x.is_contiguous()}")
@@ -18,8 +20,8 @@ def check_strides(x: Tensor):
 encode = stft.STFT(1024, 4)
 decode = stft.ISTFT(encode)
 model = None
-if os.path.exists("../../models/v0.2/latest.pt"):
-    model = VoiceCrack.load_model("../../models/v0.2/latest.pt").eval()
+if os.path.exists(f"../../models/{VERSION}/latest.pt"):
+    model = VoiceCrack.load_model(f"../../models/{VERSION}/latest.pt").eval()
     print(model.vae_prior.snr[model.vae_prior.relevant_dims()])
     print(str(model.freq_bin_filter.weight.detach().numpy()))
     print(str(model.freq_bin_filter.bias.detach().numpy()))
@@ -34,6 +36,8 @@ def load(cmd: list[str]) -> Tensor:
         wav_id = int(cmd[1]) if len(cmd) > 1 else random.randrange(0, len(dataset))
         print(f"Loaded sample {wav_id}")
         wav = dataset[wav_id][0]
+    elif cmd[0] == "pt":
+        wav = torch.load(cmd[1], map_location="cpu")
     else:
         wav = Tensor(FileSource(cmd[0], 128, 48000).get_wav())
     spec = encode(wav)

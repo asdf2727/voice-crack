@@ -15,8 +15,8 @@ from datasets.vctk import VCTK_092, SampleType
 from models import VoiceCrack
 from modules.stft import *
 from loss import *
+from voice_crack.const import VERSION
 
-VERSION = "v0.3"
 if not os.path.exists(f"../../models/{VERSION}"):
     os.mkdir(f"../../models/{VERSION}")
 
@@ -95,6 +95,8 @@ class Trainer:
                     if loss < 200: continue
                     print(f"{mag} - {vae} - {phs} - {loss}")
                     self.show_spec(wav)
+                    torch.save(wav, "input.pt")
+                self._save("bug")
                 raise AssertionError
 
             if since_last_step < step_size:
@@ -165,7 +167,7 @@ class Trainer:
 
 def main():
     model = VoiceCrack(1024, 4, 512)
-    trainer = Trainer(model, torch.device("cuda"), comp_batch=True)
+    trainer = Trainer(model, torch.device("cuda"), comp_batch=False)
     if os.path.exists(f"../../models/{VERSION}/latest.pt"):
         trainer.model.load_checkpoint(f"../../models/{VERSION}/latest.pt")
     else:

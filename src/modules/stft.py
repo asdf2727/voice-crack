@@ -17,7 +17,7 @@ def mag_phs_to_hsv(log_mag: Tensor, phs: Tensor) -> np.ndarray:
 
 
 def to_out_feats(f: Tensor):
-    return torch.stack((f[..., 5], f[..., 0], f[..., 1]), dim=-1)
+    return torch.stack((f[..., 2], f[..., 0], f[..., 1]), dim=-1)
 
 
 class STFT(nn.Module):
@@ -58,15 +58,13 @@ class STFT(nn.Module):
         init_phs = torch.zeros_like(phs[..., :1])
         phs_diff = _wrap_angle(phs.diff(prepend=init_phs))
         return torch.stack((
-            c.real, c.imag,
             unit_c.real, unit_c.imag,
-            mag, log_mag,
-            phs, phs_diff),
+            log_mag, phs, phs_diff),
             dim=-1).movedim(-2, -3)
 
     @staticmethod
     def feats_to_log_polar(f: Tensor) -> tuple[Tensor, Tensor]:
-        return f[..., 5], f[..., 6]
+        return f[..., 2], f[..., 3]
 
     def forward(self, x: Tensor) -> Tensor:
         return self.to_feats(self.stft(x))
