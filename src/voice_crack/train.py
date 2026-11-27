@@ -96,7 +96,7 @@ class Trainer:
                     mag, phs, vae = self._run_batch(wav)
                     loss = mag + phs + vae * self.vae_w
                     if loss < 200: continue
-                    print(f"{mag} - {vae} - {phs} - {loss}")
+                    print(f"{mag} - {phs} - {vae} - {loss}")
                     self.show_spec(wav)
                     torch.save(wav, "input.pt")
                 self._save("bug")
@@ -169,7 +169,7 @@ class Trainer:
 
 def main():
     model = VoiceCrack(1024, 4, 512)
-    trainer = Trainer(model, torch.device("cuda"), comp_batch=False)
+    trainer = Trainer(model, torch.device("cuda"), vae_w=0.1, comp_batch=True)
     if os.path.exists(f"../../models/{VERSION}/latest.pt"):
         trainer.model.load_checkpoint(f"../../models/{VERSION}/latest.pt")
     else:
