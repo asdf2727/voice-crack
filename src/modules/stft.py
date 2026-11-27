@@ -10,9 +10,11 @@ def mag_phs_to_hsv(log_mag: Tensor, phs: Tensor) -> np.ndarray:
         init_phs = torch.zeros_like(phs[..., :1, :])
         phs_diff = _wrap_angle(phs.diff(dim=-2, prepend=init_phs)).numpy()
         log_mag = log_mag.numpy()
-        h = ((phs_diff + np.pi) / (2 * np.pi) + 0.5) % 1
+        abs_log_mag = np.abs(log_mag)
+        log_mag_sign = (1 + np.sign(log_mag)) / 2
+        h = ((phs_diff + np.pi * log_mag_sign) / (2 * np.pi) + 0.5) % 1
         s = np.ones_like(h)
-        v = log_mag / log_mag.max()
+        v = abs_log_mag / abs_log_mag.max()
         return np.stack([h, s, v], axis=-1).transpose(1, 0, 2)
 
 

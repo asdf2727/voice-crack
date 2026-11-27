@@ -44,6 +44,9 @@ class Trainer:
                  comp_batch: bool = False):
         self.device = device
         self.model = model.to(device)
+        print(f"{sum(p.numel() for p in self.model.parameters())} total parameters:")
+        for p in self.model.parameters():
+            print(f"\t{p.numel()} - {list(p.shape)}")
         self.opt = torch.optim.Adam(self.model.parameters(), lr=lr, fused=True)
         self.vae_w = torch.tensor(vae_w)
         self.dataset = VCTK_092("../../datasets", download=True)
@@ -137,11 +140,10 @@ class Trainer:
         return False
 
     def show_spec(self, wav: Tensor):
-        spec = self.model.enc(wav)
-        print("aaaaa", file=sys.stderr)
-        show_hsv(self.model.enc.feats_to_hsv(spec.cpu()))
-        out_spec = self.model(spec).detach()
-        print("bbbbb", file=sys.stderr)
+        in_spec = self.model.enc(wav)
+        show_hsv(self.model.enc.feats_to_hsv(in_spec.cpu()))
+        padded = F.pad(in_spec, (0, 0, 0, 0, self.model.latency, 0))
+        out_spec = self.model(padded).detach()
         show_hsv(self.model.dec.feats_to_hsv(out_spec.cpu()))
 
     def run_training(self,
